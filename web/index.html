@@ -862,6 +862,7 @@ function renderOwnerChips() {
         if (e.target.checked) state.owners.add(id); else state.owners.delete(id);
         inp.parentElement.classList.toggle('on', e.target.checked);
         renderAccounts(state.accounts, state.excelAccounts);
+        renderRealtime(state.realtime);
         refreshPreview();
       });
     });
@@ -1133,17 +1134,34 @@ function renderRealtime(d) {
     if (b0) { b0.style.display = 'none'; b0.innerHTML = ''; }
     return;
   }
-  const t = d.totals;
+  const ownerSet = state.owners || new Set();
+  const onlySel = ownerSet.size > 0;
+  const visible = (rows) => (rows || []).filter((x) => !onlySel || !x.owner_id || ownerSet.has(String(x.owner_id)));
+  const accs = visible(d.accounts);
+  const prods = visible(d.products);
+  const failures = visible(d.failures);
+  const view = { ...d, accounts: accs, products: prods };
+  const cost = accs.reduce((s, a) => s + Number(a.cost || 0), 0);
+  const gmv = accs.reduce((s, a) => s + Number(a.gmv || 0), 0);
+  const t = {
+    ...(d.totals || {}),
+    cost: Math.round(cost * 100) / 100,
+    gmv: Math.round(gmv * 100) / 100,
+    roi: cost ? Math.round((gmv / cost) * 100) / 100 : 0,
+    order_cnt: accs.reduce((s, a) => s + Number(a.order_cnt || 0), 0),
+    account_rows: accs.length,
+    product_rows: prods.length,
+  };
   dateEl.textContent = d.date || '';
   timeEl.innerHTML = `抓取时间 <b>${escapeHtml(d.fetched_at || '-')}</b> · 用时 ${d.elapsed}s · `
     + `${t.account_rows} 账户 / ${t.product_rows} 商品行`
-    + ((d.failures || []).length ? ` · <span style="color:var(--err)">失败 ${d.failures.length} 个</span>` : '');
+    + (failures.length ? ` · <span style="color:var(--err)">失败 ${failures.length} 个</span>` : '');
   stats.innerHTML = `
     <div class="stat"><div class="k">消耗合计</div><div class="v">${fmt(t.cost)}<small>元</small></div></div>
     <div class="stat"><div class="k">成交合计</div><div class="v">${fmt(t.gmv)}<small>元</small></div></div>
     <div class="stat"><div class="k">整体 ROI</div><div class="v">${fmt(t.roi)}</div></div>
     <div class="stat"><div class="k">成交订单</div><div class="v">${t.order_cnt || 0}<small>单</small></div></div>`;
-  const alerts = d.alerts || [];
+  const alerts = visible(d.alerts);
   const banner = $('#alertBanner');
   if (banner) {
     if (alerts.length) {
@@ -1158,8 +1176,8 @@ function renderRealtime(d) {
     }
   }
   const overIds = new Set(alerts.map((x) => `${x.owner_id || ''}|${x.account_id}`));
-  const rows = (d.accounts || []).map((a) => {
-    const p = rtProduct(d, a);
+  const rows = accs.map((a) => {
+    const p = rtProduct(view, a);
     const name = (p && p.product_name) || a.account_name || '';
     return `<tr${overIds.has(`${a.owner_id || ''}|${a.account_id}`) ? ' class="over"' : ''}>
       <td>${escapeHtml(a.owner_label || '-')}</td>
@@ -1170,8 +1188,8 @@ function renderRealtime(d) {
       <td class="num"><input class="alertinput" type="number" min="0" step="0.01" placeholder="不预警"
         data-id="${a.account_id}" data-owner="${a.owner_id || ''}" value="${alertThresholds()[a.account_id] ?? ''}" /></td></tr>`;
   }).join('');
-  const fail = (d.failures || []).length
-    ? `<div class="hint" style="color:var(--err)">失败：${d.failures.map((f) => escapeHtml([f.owner_label, f.account_id, f.account_name].filter(Boolean).join(' ') + (f.error ? '（' + f.error.slice(0, 60) + '）' : ''))).join('、')}</div>`
+  const fail = failures.length
+    ? `<div class="hint" style="color:var(--err)">失败：${failures.map((f) => escapeHtml([f.owner_label, f.account_id, f.account_name].filter(Boolean).join(' ') + (f.error ? '（' + f.error.slice(0, 60) + '）' : ''))).join('、')}</div>`
     : '';
   body.innerHTML = (rows ? `<div class="tablebox"><table>
       <thead><tr><th>账号</th><th>账户</th><th>消耗</th><th>成交</th><th>ROI</th><th>成交订单</th><th>商品数</th><th>预警线</th></tr></thead>
