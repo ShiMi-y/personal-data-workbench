@@ -1,0 +1,459 @@
+(some characters truncated)...
+else self.ctx.new_page()
+        self.list_page.set_default_timeout(45_000)
+        self.ensure_login()
+
+    def _launch(self, headless: bool):
+        profile = Path(self.cfg.get("_profile_dir") or PROFILE_DIR)
+        profile.mkdir(parents=True, exist_ok=True)
+        return self._pw.chromium.launch_persistent_context(
+            user_data_dir=str(profile),
+            channel="chrome",
+            headless=headless,
+            viewport={"width": 1600, "height": 1000} if headless else None,
+            no_viewport=not headless,
+            args=(CHROME_ARGS + ([] if headless else ["--start-maximized"])),
+        )
+
+    def _relaunch_headed(self):
+        self.log("[login] 切换为有头模式，等待人工完成登录")
+        try:
+            self.ctx.close()
+        except Exception:
+            pass
+        self.ctx = self._launch(False)
+        self.list_page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+        self.list_page.set_default_timeout(45_000)
+
+    def close(self):
+        for obj, name in ((self.ctx, "ctx"), (self._pw, "pw")):
+            try:
+                obj.close() if name == "ctx" else obj.stop()
+            except Exception:
+                pass
+
+    # -- login ------------------------------------------------------
+    def ensure_login(self):
+        page = self.list_page
+        page.goto(ACCOUNT_LIST_URL, wait_until="domcontentloaded", timeout=60_000)
+        page.wait_for_timeout(3000)
+        if "login.kwaixiaodian.com" not in page.url:
+            self.log("[login] 登录态有效")
+            return
+
+        account = str(self.cfg.get("account") or "").strip()
+        password = str(self.cfg.get("password") or "")
+        if account and password:
+            self.log(f"[login] 密码登录（账号 {account[:3]}****）")
+            if self._password_login(page, account, password):
+                # 登录成功后会先落在 www 首页，需再进一次后台确认登录态真正生效
+                page.goto(ACCOUNT_LIST_URL, wait_until="domcontentloaded", timeout=60_000)
+                page.wait_for_timeout(4000)
+                if "login.kwaixiaodian.com" not in page.url:
+                    self.log("[login] 后台校验通过")
+                    return
+                self.log("[login] 密码登录成功但后台仍要求登录（账号可能未开通/未绑定店铺）")
+            self.log("[login] 密码登录未成功（可能触发验证码/滑块）")
+
+        self._manual_login(page)
+
+    # 登录页身份 tab 与对应的提交按钮文案（两套界面文案不同，写死任一都会导致点不到按钮）
+    LOGIN_ROLES = {
+        "owner": ("我是店主", "快手APP账号授权登录"),
+        "staff": ("我是员工", "快手商家账号登录"),
+    }
+
+    def _password_login(self, page, account: str, password: str) -> bool:
+        role = str(self.cfg.get("login_role") or "auto").lower()
+        if role not in ("auto", "owner", "staff"):
+            role = "auto"
+        # auto 先按子账号试：投放运营多用员工账号；失败且提示账号不存在时再按店主试
+        order = ["staff", "owner"] if role == "auto" else [role]
+        for i, r in enumerate(order):
+            if self._submit_password(page, account, password, r):
+                return True
+            if i < len(order) - 1:
+                self.log("[login] 该身份登录失败，切换另一种身份重试")
+        return False
+
+    def _submit_password(self, page, account: str, password: str, role: str) -> bool:
+        tab, button = self.LOGIN_ROLES[role]
+        label = "员工/子账号" if role == "staff" else "店主"
+        try:
+            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_timeout(2500)
+            page.get_by_text(tab, exact=True).first.click(timeout=8000)
+            page.wait_for_timeout(600)
+            page.get_by_text("密码登录", exact=True).first.click(timeout=8000)
+            page.wait_for_timeout(800)
+            page.locator('input[placeholder="请输入手机号"]').first.fill(account)
+            page.locator('input[placeholder="请输入密码"]').first.fill(password)
+            page.wait_for_timeout(200)
+            page.get_by_role("button", name=button).first.click(timeout=8000)
+            for _ in range(15):
+                page.wait_for_timeout(1000)
+                if "login.kwaixiaodian.com" not in page.url:
+                    self.log(f"[login] 密码登录成功（{label}）")
+                    return True
+                err = self._login_error(page)
+                if err:
+                    self.log(f"[login] {label}登录失败：{err}")
+                    return False
+            self.log(f"[login] {label}登录超时未跳转")
+            return False
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[login] 密码登录异常: {type(e).__name__}: {e}")
+            return False
+
+    @staticmethod
+    def _login_error(page) -> str:
+        """读取登录页上的错误提示（没有则返回空串）"""
+        try:
+            return page.evaluate("""() => {
+                const hit = Array.from(document.querySelectorAll('*'))
+                    .filter(e => e.children.length === 0)
+                    .map(e => (e.innerText || '').trim())
+                    .find(t => /账号不存在|密码错误|密码不正确|未注册|操作频繁|请完成验证|验证码/.test(t));
+                return hit || '';
+            }""") or ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _manual_login(self, page):
+        self._relaunch_headed()
+        page = self.list_page
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
+        timeout = int(self.cfg.get("manual_login_timeout", 600))
+        self.log(f"[login] 请在弹出的浏览器中扫码/密码登录（最多等待 {timeout} 秒）")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            page.wait_for_timeout(3000)
+            url = page.url
+            if "login.kwaixiaodian.com" not in url and "s.kwaixiaodian.com" in url:
+                self.log("[login] 人工登录完成")
+                return
+            if "login.kwaixiaodian.com" not in url:
+                page.goto(ACCOUNT_LIST_URL, wait_until="domcontentloaded", timeout=60_000)
+                page.wait_for_timeout(2000)
+                if "login.kwaixiaodian.com" not in page.url:
+                    self.log("[login] 人工登录完成")
+                    return
+        raise RuntimeError("登录超时，请检查账号密码或网络后重试")
+
+    # -- accounts ---------------------------------------------------
+    def list_accounts(self) -> list[dict]:
+        """登录后自动获取全量投放账户（myList 接口）"""
+        page = self.list_page
+        if "s.kwaixiaodian.com" not in page.url:
+            page.goto(ACCOUNT_LIST_URL, wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_timeout(3000)
+        out, seen = [], set()
+        page_size = 100
+        for page_no in range(1, 21):
+            payload = {"pageSize": page_size, "current": page_no,
+                       "queryActiveFlag": False, "pageNo": page_no}
+            res = page.evaluate(ACCOUNT_LIST_JS, payload)
+            if not res or res.get("status") != 200:
+                raise RuntimeError(f"账户列表接口异常: HTTP {(res or {}).get('status')}")
+            j = json.loads(res.get("text") or "{}")
+            items = j.get("data")
+            if isinstance(items, dict):
+                items = items.get("list") or items.get("records") or []
+            if not isinstance(items, list):
+                raise RuntimeError(f"账户列表返回结构异常: {str(j)[:200]}")
+            for it in items:
+                aid = it.get("accountId")
+                if aid is None or str(aid) in seen:
+                    continue
+                seen.add(str(aid))
+                out.append({
+                    "id": str(aid),
+                    "name": it.get("accountName") or "",
+                    "type": it.get("accountTypeName") or "",
+                    "status": it.get("reviewStatusName") or "",
+                    "corp": it.get("corpName") or "",
+                })
+            if len(items) < page_size:
+                break
+        save_accounts_cache(out, self.cfg.get("_cache_owner"))
+        return out
+
+    def open_account(self, account_id: str):
+        """从列表页点入账户首页，返回新页；调用方负责 close"""
+        page = self.list_page
+        if "s.kwaixiaodian.com" not in page.url:
+            page.goto(ACCOUNT_LIST_URL, wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_timeout(3000)
+        page.bring_to_front()
+        row = page.locator("tr", has_text=str(account_id)).first
+        if row.count() == 0:
+            raise RuntimeError(f"账户列表未找到 {account_id}")
+        with self.ctx.expect_page(timeout=30_000) as info:
+            row.locator("p.ad-shop-account-text-with-id-text-navigate").first.click()
+        home = info.value
+        home.wait_for_load_state("domcontentloaded", timeout=60_000)
+        home.wait_for_timeout(4000)
+        if not self._wait_ready(home, account_id):
+            raise RuntimeError(f"账户页未就绪: {home.url}")
+        return home
+
+    @staticmethod
+    def _wait_ready(page, account_id: str, timeout_s: int = 45) -> bool:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                if str(page.evaluate("() => window.esp_AccountId || ''")) == str(account_id):
+                    return True
+            except Exception:
+                pass
+            page.wait_for_timeout(1000)
+        return False
+
+    # -- report -----------------------------------------------------
+    def fetch_products(self, page, account_id: str, account_name: str, day: datetime,
+                       retries: int = 3) -> list[ProductRow]:
+        begin = int(day.timestamp() * 1000)
+        date_str = day.strftime("%Y-%m-%d")
+        page_size = int(self.cfg.get("page_size", 100))
+        rows: list[ProductRow] = []
+        page_no = 1
+        while True:
+            payload = {
+                "bizType": 2,
+                "reportSceneType": 19321,
+                "selectColumn": PRODUCT_COLUMNS,
+                "whereCondition": [{"name": "sceneOrientedType", "values": ["24"], "compareOp": 0}],
+                "sortCondition": [],
+                "timeCondition": {"beginTime": begin, "endTime": begin + 86_399_999, "groupType": 3},
+                "havingCondition": [],
+                "pageInfo": {"currentPage": page_no, "pageSize": page_size, "totalCount": 0},
+                "bizSubType": 22,
+                "viewType": 1,
+            }
+            res = None
+            for attempt in range(retries):
+                try:
+                    res = page.evaluate(FETCH_PRODUCTS_JS, [payload, "/promotion/report/getDetailReport"])
+                except Exception as e:  # noqa: BLE001
+                    res = {"ok": False, "err": f"{type(e).__name__}: {e}"}
+                if res and res.get("ok"):
+                    break
+                page.wait_for_timeout(800 * (attempt + 1))
+            if not res or not res.get("ok"):
+                raise RuntimeError(f"{account_id} {date_str} 取数失败: {(res or {}).get('err')}")
+
+            data = res.get("data") or {}
+            chunk = data.get("detail") or []
+            for r in chunk:
+                pid = r.get("merchantProductId")
+                if not pid:
+                    continue
+                rows.append(ProductRow(
+                    date=date_str,
+                    account_id=str(account_id),
+                    account_name=account_name,
+                    product_id=str(pid),
+                    product_name=(r.get("itemName") or "").strip(),
+                    cost=round((r.get("costTotal") or 0) / 1000, 2),
+                    gmv=round((r.get("t0OrderPaymentAmt") or 0) / 1000, 2),
+                    order_cnt=int(r.get("t0OrderCnt") or 0),
+                    roi=round(float(r.get("t0Roi") or 0), 4),
+                    show_cnt=int(r.get("showCnt") or 0),
+                    click_cnt=int(r.get("itemEntranceClkCnt") or 0),
+                ))
+            total = int(data.get("totalCount") or 0)
+            if not chunk or len(rows) >= total:
+                break
+            page_no += 1
+        return rows
+
+
+def accounts_cache_path(owner: str | None = None) -> Path:
+    return ACCOUNTS_CACHE if not owner else (DATA_DIR / f"accounts_cache_{owner}.json")
+
+
+def save_accounts_cache(accounts: list[dict], owner: str | None = None):
+    try:
+        path = accounts_cache_path(owner)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "updated_at": datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S"),
+            "accounts": accounts,
+        }, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_accounts_cache(owner: str | None = None) -> tuple[list[dict], str]:
+    path = accounts_cache_path(owner)
+    if not path.exists():
+        return [], ""
+    try:
+        j = json.loads(path.read_text(encoding="utf-8"))
+        return j.get("accounts") or [], j.get("updated_at") or ""
+    except Exception:
+        return [], ""
+
+
+def excel_account_ids(path: Path) -> list[str]:
+    """读月度表第 3 行的账户ID（用于与后台账户取交集）"""
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True)
+        ws = wb["消耗成交"] if "消耗成交" in wb.sheetnames else wb[wb.sheetnames[0]]
+        ids = []
+        for row in ws.iter_rows(min_row=3, max_row=3, min_col=2, max_col=28):
+            for c in row:
+                if c.value is not None and str(c.value).strip():
+                    ids.append(str(c.value).strip())
+        wb.close()
+        return ids
+    except Exception:
+        return []
+
+
+def pick_accounts(all_accounts: list[dict], cfg: dict, ids: list[str] | None = None) -> list[dict]:
+    """账户筛选优先级：显式 ids > include/exclude 配置 > 与月度表取交集 > 全部"""
+    exclude = {str(x) for x in (cfg.get("exclude_accounts") or [])}
+    pool = [a for a in all_accounts if a["id"] not in exclude]
+
+    if ids:
+        wanted = {str(x) for x in ids}
+        return [a for a in pool if a["id"] in wanted]
+
+    include = cfg.get("include_accounts") or []
+    if include:
+        wanted = {str(x) for x in include}
+        return [a for a in pool if a["id"] in wanted]
+
+    if cfg.get("filter_by_excel", True) and cfg.get("excel_path"):
+        try:
+            excel = resolve_path(cfg["excel_path"])
+        except Exception:
+            excel = None
+        if excel and excel.exists():
+            table_ids = set(excel_account_ids(excel))
+            if table_ids:
+                inter = [a for a in pool if a["id"] in table_ids]
+                if inter:
+                    return inter
+    return pool
+
+
+def fetch_accounts(cfg: dict, logger=print) -> list[dict]:
+    """独立获取账户列表（供网页刷新用）"""
+    with Client(cfg, logger) as client:
+        accounts = client.list_accounts()
+        logger(f"[accounts] 获取到 {len(accounts)} 个账户")
+        return accounts
+
+
+def today_str() -> str:
+    return datetime.now(CST).strftime("%Y-%m-%d")
+
+
+def fetch_today(cfg: dict, account_ids: list[str] | None = None, logger=print) -> dict:
+    """当日实时数据：全账号 × 全商品，聚合到账户维度（只写缓存，不落导出目录）"""
+    started = time.time()
+    day = datetime.strptime(today_str(), "%Y-%m-%d").replace(tzinfo=CST)
+    prod: list[ProductRow] = []
+    failures: list[dict] = []
+
+    with Client(cfg, logger) as client:
+        all_accounts = client.list_accounts()
+        accounts = pick_accounts(all_accounts, cfg, account_ids)
+        if not accounts:
+            raise RuntimeError("没有可查询的账户（检查登录态或 include/exclude 配置）")
+        logger(f"[实时] 账户 {len(accounts)} 个，查询日期 {day:%Y-%m-%d}")
+        for acc in accounts:
+            aid, aname = str(acc["id"]), acc.get("name") or ""
+            home = None
+            try:
+                home = client.open_account(aid)
+                rows = client.fetch_products(home, aid, aname, day)
+                prod.extend(rows)
+                logger(f"    {aname or aid} 商品 {len(rows)} 个 花费 {round(sum(r.cost for r in rows), 2)} "
+                       f"成交 {round(sum(r.gmv for r in rows), 2)}")
+            except Exception as e:  # noqa: BLE001
+                logger(f"    {aname or aid} 失败: {type(e).__name__}: {e}")
+                failures.append({"account_id": aid, "account_name": aname, "error": str(e)[:300]})
+            finally:
+                if home is not None:
+                    try:
+                        home.close()
+                    except Exception:
+                        pass
+
+    agg = aggregate(prod)
+    total_cost = round(sum(a["cost"] for a in agg), 2)
+    total_gmv = round(sum(a["gmv"] for a in agg), 2)
+
+    # 账户行挂主商品（消耗最大的那个），便于页面展示「商品 + 账户」
+    primary: dict[str, tuple] = {}
+    for r in prod:
+        cur = primary.get(r.account_id)
+        if cur is None or (r.cost, r.gmv) > cur[0]:
+            primary[r.account_id] = ((r.cost, r.gmv), r.product_id, r.product_name)
+    accounts_out = []
+    for a in agg:
+        row = dict(a, roi=round(a["gmv"] / a["cost"], 2) if a["cost"] else 0.0)
+        item = primary.get(a["account_id"])
+        if item:
+            row["product_id"], row["product_name"] = item[1], item[2]
+        accounts_out.append(row)
+
+    data = {
+        "date": day.strftime("%Y-%m-%d"),
+        "fetched_at": datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S"),
+        "elapsed": round(time.time() - started, 1),
+        "accounts": accounts_out,
+        "products": [{"date": r.date, "account_id": r.account_id, "account_name": r.account_name,
+                      "product_id": r.product_id, "product_name": r.product_name,
+                      "cost": r.cost, "gmv": r.gmv, "order_cnt": r.order_cnt, "roi": r.roi} for r in prod],
+        "totals": {
+            "cost": total_cost,
+            "gmv": total_gmv,
+            "roi": round(total_gmv / total_cost, 2) if total_cost else 0,
+            "order_cnt": sum(a["order_cnt"] for a in agg),
+            "account_rows": len(agg),
+            "product_rows": len(prod),
+        },
+        "failures": failures,
+    }
+    save_realtime_cache(data)
+    logger(f"[实时] 完成：账户 {len(agg)} 消耗 {total_cost} 成交 {total_gmv} 用时 {data['elapsed']}s")
+    return data
+
+
+def save_realtime_cache(data: dict):
+    try:
+        REALTIME_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        REALTIME_CACHE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_realtime_cache() -> dict | None:
+    if not REALTIME_CACHE.exists():
+        return None
+    try:
+        return json.loads(REALTIME_CACHE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def aggregate(rows: Iterable[ProductRow]) -> list[dict]:
+    """商品行 -> 账户×日期 汇总"""
+    agg: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r.date, r.account_id)
+        a = agg.setdefault(key, {
+            "date": r.date, "account_id": r.account_id, "account_name": r.account_name,
+            "cost": 0.0, "gmv": 0.0, "order_cnt": 0, "product_count": 0,
+        })
+        a["cost"] = round(a["cost"] + r.cost, 2)
+        a["gmv"] = round(a["gmv"] + r.gmv, 2)
+        a["order_cnt"] += r.order_cnt
+        a["product_count"] += 1
+    return sorted(agg.values(), key=lambda x: (x["date"], x["account_id"]))
+
