@@ -10,8 +10,10 @@ logs/
 __pycache__/
 # 打包与发布产物
 dist/
+dist_*/
 dist.rar
 build/
+build_*/
 *.spec
 release/
 updates/
