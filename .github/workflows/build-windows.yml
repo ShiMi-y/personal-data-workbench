@@ -55,6 +55,16 @@ jobs:
           Write-Host "version=$version"
           Write-Host "zip=$zipName"
 
+      - name: Sync version into source
+        shell: pwsh
+        run: |
+          $p = 'kx_core.py'
+          $c = Get-Content $p -Raw
+          $replacement = 'APP_VERSION = "' + $env:APP_VERSION + '"'
+          $c = $c -replace 'APP_VERSION = "[^"]*"', $replacement
+          Set-Content -Path $p -Value $c -Encoding utf8
+          Select-String -Path $p -Pattern 'APP_VERSION' | Select-Object -First 1
+
       - name: Build with PyInstaller
         shell: pwsh
         env:
