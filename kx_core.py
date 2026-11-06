@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ else:
     BUNDLE_DIR = BASE
 
 CONFIG_PATH = BASE / "config.json"
+APP_VERSION = "1.1.0"
 PROFILE_DIR = BASE / ".browser_profile"
 PROFILES_DIR = BASE / ".browser_profiles"
 DATA_DIR = BASE / "data"
@@ -121,7 +123,7 @@ def load_config(path: Path | None = None) -> dict:
     cfg.setdefault("manual_login_timeout", 600)
     cfg.setdefault("auto_backup", True)
     cfg.setdefault("backup_limit", 10)
-    cfg.setdefault("version", "1.1.0")
+    cfg.setdefault("version", APP_VERSION)
     cfg.setdefault("update_repo", "")
     cfg.setdefault("update_source", "github")
     cfg.setdefault("update_webdav_path", "/version.json")
@@ -136,6 +138,10 @@ def load_config(path: Path | None = None) -> dict:
         except OSError as e:
             print(f"[config] 配置升级后写回失败: {e}")
     return cfg
+
+
+def _ver_tuple(v) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:6]) or (0,)
 
 
 def _normalize_accounts(cfg: dict) -> bool:
@@ -220,6 +226,12 @@ def _normalize_accounts(cfg: dict) -> bool:
         if k in cfg:
             cfg.pop(k, None)
             changed = True
+
+    # 程序升级后同步配置里的版本号，避免升级完成仍提示有新版本
+    cur = str(cfg.get("version") or "").strip()
+    if not cur or _ver_tuple(cur) < _ver_tuple(APP_VERSION):
+        cfg["version"] = APP_VERSION
+        changed = True
     return changed
 
 
