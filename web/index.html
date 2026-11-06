@@ -341,6 +341,7 @@
         </div>
       </div>
     </div>
+    <div class="hint">实时自动刷新由后台调度执行：关闭网页、仅保留托盘时，仍会按间隔和时段自动抓取并触发消耗预警。</div>
     <div class="toolbar">
       <button class="primary" id="btnSaveCfg">保存配置</button>
       <button class="ghost" id="btnReloadCfg">重新读取</button>
@@ -1210,8 +1211,8 @@ function fmtClock(ts) {
 
 function updateRtAutoHint() {
   const hint = $('#rtAutoHint');
-  if (!rtAutoCfg.on) { hint.textContent = '自动刷新已关闭'; return; }
-  const base = `每 ${rtAutoCfg.min} 分钟（${rtAutoCfg.a}–${rtAutoCfg.b}）`;
+  if (!rtAutoCfg.on) { hint.textContent = '自动刷新已关闭（后台不抓取）'; return; }
+  const base = `每 ${rtAutoCfg.min} 分钟（${rtAutoCfg.a}–${rtAutoCfg.b}，后台运行）`;
   if (!inRtWindow()) { hint.textContent = `${base} · 当前不在时段`; return; }
   const next = rtLastAuto + rtAutoCfg.min * 60 * 1000;
   hint.textContent = `${base} · 下次 ${fmtClock(next)}`;
