@@ -1,0 +1,23 @@
+{
+  "accounts": [],
+  "headless": true,
+  "date_offset_days": 1,
+  "page_size": 100,
+  "manual_login_timeout": 600,
+  "version": "1.1.0",
+  "update_repo": "",
+  "update_source": "github",
+  "update_webdav_path": "/version.json",
+  "auto_backup": true,
+  "backup_limit": 10,
+  "realtime_auto_refresh": false,
+  "realtime_interval_minutes": 5,
+  "realtime_window_start": "08:50",
+  "realtime_window_end": "18:05",
+  "filter_by_excel": true,
+  "web": {
+    "host": "127.0.0.1",
+    "port": 8765
+  }
+}
+
