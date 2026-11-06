@@ -481,24 +481,6 @@ function accountLabel(a) {
   return `${escapeHtml(name)}<span class="muted"> ${escapeHtml(String(id))}</span>`;
 }
 
-function rtProduct(d, a) {
-  let best = null;
-  if (a.product_id) best = { product_name: a.product_name, product_id: a.product_id };
-  else {
-    (d.products || []).forEach((p) => {
-      if (String(p.account_id) !== String(a.account_id)) return;
-      if (a.owner_id && p.owner_id && String(p.owner_id) !== String(a.owner_id)) return;
-      if (!best || Number(p.cost) > Number(best.cost)) best = p;
-    });
-  }
-  // 月度表里的短商品名优先展示，保持与表内一致
-  const pm = productOf(a.account_id, a.owner_id);
-  if (pm && pm.product_name) {
-    return { product_name: pm.product_name, product_id: pm.product_id || (best && best.product_id) };
-  }
-  return best;
-}
-
 function currentRange() {
   if ($('#mode').value === 'single') {
     const d = $('#date').value;
@@ -1140,7 +1122,6 @@ function renderRealtime(d) {
   const accs = visible(d.accounts);
   const prods = visible(d.products);
   const failures = visible(d.failures);
-  const view = { ...d, accounts: accs, products: prods };
   const cost = accs.reduce((s, a) => s + Number(a.cost || 0), 0);
   const gmv = accs.reduce((s, a) => s + Number(a.gmv || 0), 0);
   const t = {
@@ -1177,8 +1158,7 @@ function renderRealtime(d) {
   }
   const overIds = new Set(alerts.map((x) => `${x.owner_id || ''}|${x.account_id}`));
   const rows = accs.map((a) => {
-    const p = rtProduct(view, a);
-    const name = (p && p.product_name) || a.account_name || '';
+    const name = a.account_name || a.account_id || '';
     return `<tr${overIds.has(`${a.owner_id || ''}|${a.account_id}`) ? ' class="over"' : ''}>
       <td>${escapeHtml(a.owner_label || '-')}</td>
       <td>${escapeHtml(name)}<span class="muted"> ${escapeHtml(String(a.account_id))}</span></td>
@@ -1378,6 +1358,7 @@ function renderPreview(p) {
     const tag = f.owner_label ? `[${escapeHtml(f.owner_label)}] ` : '';
     return `${tag}<a href="#" data-open="${f.accounts_csv}">账户汇总 CSV</a>
       <a href="#" data-open="${f.products_csv}">商品明细 CSV</a>
+      ${f.products_raw_exists ? `<a href="#" data-open="${f.products_raw_csv}">商品原始 CSV</a>` : ''}
       <a href="#" data-open="${f.xlsx}">明细 Excel</a>`;
   }).join('<span style="width:8px"></span>');
   links.querySelectorAll('a').forEach((a) => a.addEventListener('click', async (e) => {
@@ -1439,10 +1420,11 @@ async function runMerge() {
     });
     const results = res.results || [];
     const locked = results.filter((r) => r.locked);
-    if (locked.length) {
-      alert(`合并未完成：以下月度表正被占用\n\n${locked.map((r) => `[${r.owner_label}] ${r.excel}`).join('\n')}\n\n请先关闭 WPS / Excel 后重试。`);
-    }
-    $('#mergeBody').innerHTML = results.map((r) => {
+    const failed = results.filter((r) => r.error && !r.locked);
+    const savedN = results.filter((r) => r.saved).length;
+    const addedN = results.reduce((n, r) => n + (r.added_columns || []).length, 0);
+    const timeLine = `<div class="hint" style="margin:0 0 10px">开始 <b>${escapeHtml(res.started_at || '-')}</b> · 完成 <b>${escapeHtml(res.finished_at || '-')}</b> · 用时 ${res.elapsed ?? '-'} 秒</div>`;
+    $('#mergeBody').innerHTML = timeLine + (results.map((r) => {
       if (r.error) {
         return `<div class="accresult">
           <div class="top"><b>${escapeHtml(r.owner_label || '')}</b><span class="badge err">失败</span></div>
@@ -1453,16 +1435,29 @@ async function runMerge() {
           <span><b>${escapeHtml(c.name)}</b>${c.detail ? `<span class="muted"> — ${escapeHtml(c.detail)}</span>` : ''}</span>
         </li>`).join('');
       const resultText = r.saved ? '已保存' : (r.locked ? '文件被占用' : '未保存');
+      const added = (r.added_columns || []).map((g) =>
+        `${escapeHtml(g.product_name || '')}${g.product_id ? `（${escapeHtml(String(g.product_id))}）` : ''} @ ${escapeHtml(g.range || '')}`).join('、');
       return `<div class="accresult">
         <div class="top"><b>${escapeHtml(r.owner_label || '')}</b>
           <span class="badge ${r.saved ? 'ok' : 'err'}">${resultText}</span>
           <span class="muted">写入 ${r.written} 条 · 消耗 ${fmt(r.total_cost)} · 成交 ${fmt(r.total_gmv)}</span>
         </div>
+        <div class="hint">开始 ${escapeHtml(r.started_at || res.started_at || '-')}
+          · 完成 ${escapeHtml(r.finished_at || res.finished_at || '-')}
+          · 用时 ${r.elapsed ?? res.elapsed ?? '-'} 秒</div>
         <div class="path">${escapeHtml(r.excel || '')}</div>
+        ${added ? `<div class="hint" style="color:var(--warn)">新增商品列：${added}</div>` : ''}
         ${r.locked ? `<div class="hint" style="color:var(--err);margin-top:6px">${escapeHtml(r.error || '文件被占用')}</div>` : ''}
         <ul class="checks">${items}</ul>
       </div>`;
-    }).join('') || '<div class="empty">没有可合并的账号</div>';
+    }).join('') || '<div class="empty">没有可合并的账号</div>');
+    if (locked.length) {
+      alert(`合并未完成：以下月度表正被占用\n\n${locked.map((r) => `[${r.owner_label}] ${r.excel}`).join('\n')}\n\n请先关闭 WPS / Excel 后重试。`);
+    } else {
+      alert(`合并完成\n起始：${res.started_at || '-'}\n完成：${res.finished_at || '-'}\n用时：${res.elapsed ?? '-'} 秒\n已保存：${savedN}/${results.length} 个账号`
+        + (addedN ? `\n新增商品列：${addedN} 个` : '')
+        + (failed.length ? `\n失败：${failed.length} 个账号` : ''));
+    }
   } catch (e) {
     $('#mergeBody').innerHTML = `<div class="empty" style="color:var(--err)">合并失败：${escapeHtml(e.message)}</div>`;
   } finally {
