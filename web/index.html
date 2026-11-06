@@ -1,0 +1,460 @@
+(some characters truncated)...
+    }
+    reevaluateAlerts();
+  } catch (e) {
+    alert('保存预警线失败：' + e.message);
+  }
+}
+
+function reevaluateAlerts() {
+  if (!state.realtime) { updateAlertBadge(); return; }
+  const th = alertThresholds();
+  const alerts = (state.realtime.accounts || []).filter((a) => {
+    const lim = Number(th[a.account_id] || 0);
+    return lim > 0 && Number(a.cost) > lim;
+  }).map((a) => ({
+    account_id: a.account_id,
+    account_name: a.account_name || '',
+    product_name: a.product_name || '',
+    owner_id: a.owner_id || '',
+    owner_label: a.owner_label || '',
+    cost: Number(a.cost),
+    limit: Number(th[a.account_id]),
+  }));
+  state.realtime.alerts = alerts;
+  renderRealtime(state.realtime);
+}
+
+async function refreshAccounts(silent) {
+  const btn = $('#btnRefreshAcc');
+  btn.disabled = true;
+  if (!silent) showLog(true);
+  logLine('正在从后台获取账户列表…');
+  try {
+    const { job_id } = await api('/api/accounts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ owners: selectedOwners() }),
+    });
+    let seen = 0;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 1200));
+      const job = await api('/api/job?id=' + job_id);
+      for (; seen < job.logs.length; seen++) logLine(job.logs[seen]);
+      if (job.status === 'done' || job.status === 'error') {
+        if (job.status === 'error') { logLine('获取失败：' + job.error, true); break; }
+        renderAccounts(job.result.accounts || [], state.excelAccounts);
+        logLine(`账户已更新：${(job.result.accounts || []).length} 个`);
+        break;
+      }
+    }
+  } catch (e) {
+    logLine('异常：' + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderRealtime(d) {
+  state.realtime = d && d.totals ? d : null;
+  const stats = $('#rtStats'), body = $('#rtBody'), timeEl = $('#rtTime'), dateEl = $('#rtDate');
+  if (!state.realtime) {
+    dateEl.textContent = '-';
+    stats.innerHTML = '';
+    body.innerHTML = '<div class="empty">点击「更新实时数据」获取当日（今天）数据</div>';
+    timeEl.textContent = '尚未抓取';
+    const b0 = $('#alertBanner');
+    if (b0) { b0.style.display = 'none'; b0.innerHTML = ''; }
+    return;
+  }
+  const t = d.totals;
+  dateEl.textContent = d.date || '';
+  timeEl.innerHTML = `抓取时间 <b>${escapeHtml(d.fetched_at || '-')}</b> · 用时 ${d.elapsed}s · `
+    + `${t.account_rows} 账户 / ${t.product_rows} 商品行`
+    + ((d.failures || []).length ? ` · <span style="color:var(--err)">失败 ${d.failures.length} 个</span>` : '');
+  stats.innerHTML = `
+    <div class="stat"><div class="k">消耗合计</div><div class="v">${fmt(t.cost)}<small>元</small></div></div>
+    <div class="stat"><div class="k">成交合计</div><div class="v">${fmt(t.gmv)}<small>元</small></div></div>
+    <div class="stat"><div class="k">整体 ROI</div><div class="v">${fmt(t.roi)}</div></div>
+    <div class="stat"><div class="k">成交订单</div><div class="v">${t.order_cnt || 0}<small>单</small></div></div>`;
+  const alerts = d.alerts || [];
+  const banner = $('#alertBanner');
+  if (banner) {
+    if (alerts.length) {
+      banner.style.display = 'block';
+      banner.innerHTML = '⚠ 消耗超预警线：' + alerts.map((x) => {
+        const nm = x.account_name || x.account_id;
+        return `<b>${escapeHtml(nm)}</b> ${fmt(x.cost)} / ${fmt(x.limit)}`;
+      }).join('；');
+    } else {
+      banner.style.display = 'none';
+      banner.innerHTML = '';
+    }
+  }
+  const overIds = new Set(alerts.map((x) => `${x.owner_id || ''}|${x.account_id}`));
+  const rows = (d.accounts || []).map((a) => {
+    const p = rtProduct(d, a);
+    const name = (p && p.product_name) || a.account_name || '';
+    return `<tr${overIds.has(`${a.owner_id || ''}|${a.account_id}`) ? ' class="over"' : ''}>
+      <td>${escapeHtml(a.owner_label || '-')}</td>
+      <td>${escapeHtml(name)}<span class="muted"> ${escapeHtml(String(a.account_id))}</span></td>
+      <td class="num">${fmt(a.cost)}</td><td class="num">${fmt(a.gmv)}</td>
+      <td class="num">${fmt(a.roi)}</td><td class="num">${a.order_cnt}</td>
+      <td class="num">${a.product_count}</td>
+      <td class="num"><input class="alertinput" type="number" min="0" step="0.01" placeholder="不预警"
+        data-id="${a.account_id}" data-owner="${a.owner_id || ''}" value="${alertThresholds()[a.account_id] ?? ''}" /></td></tr>`;
+  }).join('');
+  const fail = (d.failures || []).length
+    ? `<div class="hint" style="color:var(--err)">失败：${d.failures.map((f) => escapeHtml([f.owner_label, f.account_id, f.account_name].filter(Boolean).join(' ') + (f.error ? '（' + f.error.slice(0, 60) + '）' : ''))).join('、')}</div>`
+    : '';
+  body.innerHTML = (rows ? `<div class="tablebox"><table>
+      <thead><tr><th>账号</th><th>账户</th><th>消耗</th><th>成交</th><th>ROI</th><th>成交订单</th><th>商品数</th><th>预警线</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>` : '<div class="empty">当日暂无消耗数据</div>') + fail;
+  body.querySelectorAll('.alertinput').forEach((inp) => {
+    inp.addEventListener('input', () => {
+      clearTimeout(alertSaveTimer);
+      alertSaveTimer = setTimeout(saveAlertThresholds, 800);
+    });
+  });
+  updateAlertBadge();
+}
+
+let rtAutoTimer = null;
+let rtLastAuto = 0;
+let rtAutoCfg = { on: false, min: 5, a: '08:50', b: '18:05' };
+
+function rtMinuteOf(t, fallback) {
+  const s = String(t || fallback);
+  const [h, m] = s.split(':').map(Number);
+  return (Number.isFinite(h) ? h : 0) * 60 + (Number.isFinite(m) ? m : 0);
+}
+
+function inRtWindow() {
+  const c = state.cfg || {};
+  const now = new Date();
+  const cur = now.getHours() * 60 + now.getMinutes();
+  const a = rtMinuteOf(c.realtime_window_start, '08:50');
+  const b = rtMinuteOf(c.realtime_window_end, '18:05');
+  return a <= b ? (cur >= a && cur <= b) : (cur >= a || cur <= b);
+}
+
+function fmtClock(ts) {
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function updateRtAutoHint() {
+  const hint = $('#rtAutoHint');
+  if (!rtAutoCfg.on) { hint.textContent = '自动刷新已关闭'; return; }
+  const base = `每 ${rtAutoCfg.min} 分钟（${rtAutoCfg.a}–${rtAutoCfg.b}）`;
+  if (!inRtWindow()) { hint.textContent = `${base} · 当前不在时段`; return; }
+  const next = rtLastAuto + rtAutoCfg.min * 60 * 1000;
+  hint.textContent = `${base} · 下次 ${fmtClock(next)}`;
+}
+
+function setupRtAuto() {
+  const c = state.cfg || {};
+  const on = !!c.realtime_auto_refresh;
+  const chk = $('#rtAutoChk');
+  if (chk) chk.checked = on;
+  if (rtAutoTimer) { clearInterval(rtAutoTimer); rtAutoTimer = null; }
+  rtAutoCfg = {
+    on,
+    min: Math.max(1, Number(c.realtime_interval_minutes) || 5),
+    a: c.realtime_window_start || '08:50',
+    b: c.realtime_window_end || '18:05',
+  };
+  if (!on) { updateRtAutoHint(); return; }
+  rtLastAuto = Date.now();
+  updateRtAutoHint();
+  rtAutoTimer = setInterval(async () => {
+    updateRtAutoHint();
+    if (state.rtBusy) return;
+    if (!inRtWindow()) return;
+    if (Date.now() - rtLastAuto < rtAutoCfg.min * 60 * 1000) return;
+    rtLastAuto = Date.now();
+    await refreshRealtime(true);
+  }, 30 * 1000);
+}
+
+async function refreshRealtime(auto = false) {
+  if (state.rtBusy) return;
+  state.rtBusy = true;
+  const btn = $('#btnRealtime');
+  btn.disabled = true;
+  btn.textContent = '抓取中…';
+  $('#rtTime').textContent = '正在登录后台并抓取当日数据…';
+  try {
+    const { job_id } = await api('/api/realtime', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ owners: selectedOwners() }),
+    });
+    let last = '';
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const job = await api('/api/job?id=' + job_id);
+      const logs = job.logs || [];
+      if (logs.length && logs[logs.length - 1] !== last) {
+        last = logs[logs.length - 1];
+        $('#rtTime').textContent = last;
+      }
+      if (job.status === 'done' || job.status === 'error') {
+        if (job.status === 'error') $('#rtTime').textContent = '抓取失败：' + job.error;
+        else renderRealtime(job.result);
+        break;
+      }
+    }
+  } catch (e) {
+    $('#rtTime').textContent = '抓取失败：' + e.message;
+  } finally {
+    state.rtBusy = false;
+    rtLastAuto = Date.now();
+    updateRtAutoHint();
+    btn.disabled = false;
+    btn.textContent = '更新实时数据';
+  }
+}
+
+function updateScope() {
+  const n = selectedIds().length;
+  const o = selectedOwners().length;
+  const { start, end } = currentRange();
+  $('#scopeHint').textContent = n
+    ? `${o} 个账号 · 已选 ${n} 个账户 · ${start}${start !== end ? ' ~ ' + end : ''}`
+    : (o ? '未选择账户' : '请先选择登录账号');
+  $('#btnMerge').disabled = !(state.preview && state.preview.totals.account_rows > 0);
+}
+
+async function refreshPreview() {
+  const { start, end } = currentRange();
+  if (!start || !end) return;
+  const ids = selectedIds();
+  const q = new URLSearchParams({ start, end });
+  if (ids.length) q.set('accounts', ids.join(','));
+  if (selectedOwners().length) q.set('owners', selectedOwners().join(','));
+  try {
+    const p = await api('/api/preview?' + q.toString());
+    state.preview = p;
+    renderPreview(p);
+  } catch (e) {
+    renderPreview(null);
+  }
+  updateScope();
+}
+
+function renderPreview(p) {
+  const stats = $('#stats');
+  const body = $('#previewBody');
+  const links = $('#fileLinks');
+  if (!p || !p.exists || !p.accounts.length) {
+    stats.innerHTML = '';
+    body.innerHTML = '<div class="empty">该日期范围还没有导出数据，点击「拉取全量数据」</div>';
+    links.innerHTML = '';
+    return;
+  }
+  const t = p.totals;
+  stats.innerHTML = `
+    <div class="stat"><div class="k">消耗合计</div><div class="v">${fmt(t.cost)}<small>元</small></div></div>
+    <div class="stat"><div class="k">成交合计</div><div class="v">${fmt(t.gmv)}<small>元</small></div></div>
+    <div class="stat"><div class="k">整体 ROI</div><div class="v">${fmt(t.roi)}</div></div>
+    <div class="stat"><div class="k">账户 / 商品行</div><div class="v">${t.account_rows}<small>/ ${t.product_rows} 行</small></div></div>`;
+
+  const rows = p.accounts.map((a) => {
+    const roi = Number(a.cost) ? (Number(a.gmv) / Number(a.cost)) : 0;
+    return `<tr>
+      <td>${a.date}</td>
+      <td>${escapeHtml(a.owner_label || '-')}</td>
+      <td>${accountLabel(a)}</td>
+      <td class="num">${fmt(a.cost)}</td><td class="num">${fmt(a.gmv)}</td><td class="num">${fmt(roi)}</td>
+      <td class="num">${a.order_cnt}</td><td class="num">${a.product_count}</td></tr>`;
+  }).join('');
+
+  const prows = p.products.slice(0, 300).map((x) => `<tr>
+      <td>${x.date}</td><td>${escapeHtml(x.owner_label || '-')}</td><td>${accountLabel(x)}</td>
+      <td style="text-align:left">${productLabel((x.product_name || '').slice(0, 40), x.product_id)}</td>
+      <td class="num">${fmt(x.cost)}</td><td class="num">${fmt(x.gmv)}</td><td class="num">${x.order_cnt}</td>
+      <td class="num">${fmt(x.roi)}</td></tr>`).join('');
+
+  body.innerHTML = `
+    <div class="tablebox"><table>
+      <thead><tr><th>日期</th><th>账号</th><th>账户</th><th>消耗</th><th>成交</th><th>ROI</th><th>成交订单</th><th>商品数</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <details>
+      <summary>展开商品明细（共 ${p.products.length} 行，最多展示 300 行）</summary>
+      <div class="tablebox"><table>
+        <thead><tr><th>日期</th><th>账号</th><th>账户</th><th style="text-align:left">商品</th><th>消耗</th><th>成交</th><th>成交订单</th><th>ROI</th></tr></thead>
+        <tbody>${prows}</tbody></table></div>
+    </details>`;
+  const files = p.owner_files && p.owner_files.length ? p.owner_files : [{
+    owner_label: '', accounts_csv: p.files.accounts_csv,
+    products_csv: p.files.products_csv, xlsx: p.files.xlsx,
+  }];
+  links.innerHTML = `<span>原始文件：</span>` + files.map((f) => {
+    const tag = f.owner_label ? `[${escapeHtml(f.owner_label)}] ` : '';
+    return `${tag}<a href="#" data-open="${f.accounts_csv}">账户汇总 CSV</a>
+      <a href="#" data-open="${f.products_csv}">商品明细 CSV</a>
+      <a href="#" data-open="${f.xlsx}">明细 Excel</a>`;
+  }).join('<span style="width:8px"></span>');
+  links.querySelectorAll('a').forEach((a) => a.addEventListener('click', async (e) => {
+    e.preventDefault();
+    try { await api('/api/open-file?path=' + encodeURIComponent(a.dataset.open)); }
+    catch (err) { alert('打开失败：' + err.message); }
+  }));
+}
+
+async function runExport() {
+  const { start, end } = currentRange();
+  if (!start || !end) return alert('请选择日期');
+  const ids = selectedIds();
+  const byOwner = selectedByOwner();
+  if (!ids.length || !Object.keys(byOwner).length) return alert('请至少选择一个账户');
+  const btn = $('#btnExport');
+  btn.disabled = true;
+  showLog(true);
+  $('#log').innerHTML = '';
+  logLine(`开始拉取：${start}${start !== end ? ' ~ ' + end : ''}，${Object.keys(byOwner).length} 个账号 / ${ids.length} 个账户`);
+  try {
+    const { job_id } = await api('/api/export', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ start, end, owners: Object.keys(byOwner), accounts_by_owner: byOwner }),
+    });
+    let seen = 0;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 1200));
+      const job = await api('/api/job?id=' + job_id);
+      for (; seen < job.logs.length; seen++) logLine(job.logs[seen]);
+      if (job.status === 'done' || job.status === 'error') {
+        if (job.status === 'error') logLine('失败：' + job.error, true);
+        else logLine('拉取完成');
+        break;
+      }
+    }
+    await refreshPreview();
+  } catch (e) {
+    logLine('异常：' + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function runMerge() {
+  const { start, end } = currentRange();
+  const ids = selectedIds();
+  const byOwner = selectedByOwner();
+  if (!ids.length || !Object.keys(byOwner).length) return alert('请至少选择一个账户');
+  const bkText = (state.cfg && state.cfg.auto_backup === false) ? '未开启自动备份' : '会先自动备份';
+  if (!confirm(`确认把 ${start}${start !== end ? ' ~ ' + end : ''} 的 ${ids.length} 个账户数据合并进各自月度表？\n（${Object.keys(byOwner).length} 个账号，${bkText}）`)) return;
+  const btn = $('#btnMerge');
+  btn.disabled = true;
+  $('#mergeBody').innerHTML = '<div class="empty">合并中…</div>';
+  try {
+    const res = await api('/api/merge', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ start, end, owners: Object.keys(byOwner), accounts_by_owner: byOwner }),
+    });
+    const results = res.results || [];
+    const locked = results.filter((r) => r.locked);
+    if (locked.length) {
+      alert(`合并未完成：以下月度表正被占用\n\n${locked.map((r) => `[${r.owner_label}] ${r.excel}`).join('\n')}\n\n请先关闭 WPS / Excel 后重试。`);
+    }
+    $('#mergeBody').innerHTML = results.map((r) => {
+      if (r.error) {
+        return `<div class="accresult">
+          <div class="top"><b>${escapeHtml(r.owner_label || '')}</b><span class="badge err">失败</span></div>
+          <div class="path">${escapeHtml(r.error)}</div></div>`;
+      }
+      const items = (r.checks || []).map((c) => `<li>
+          <span class="flag ${c.ok ? 'pass' : 'fail'}">${c.ok ? 'PASS' : 'FAIL'}</span>
+          <span><b>${escapeHtml(c.name)}</b>${c.detail ? `<span class="muted"> — ${escapeHtml(c.detail)}</span>` : ''}</span>
+        </li>`).join('');
+      const resultText = r.saved ? '已保存' : (r.locked ? '文件被占用' : '未保存');
+      return `<div class="accresult">
+        <div class="top"><b>${escapeHtml(r.owner_label || '')}</b>
+          <span class="badge ${r.saved ? 'ok' : 'err'}">${resultText}</span>
+          <span class="muted">写入 ${r.written} 条 · 消耗 ${fmt(r.total_cost)} · 成交 ${fmt(r.total_gmv)}</span>
+        </div>
+        <div class="path">${escapeHtml(r.excel || '')}</div>
+        ${r.locked ? `<div class="hint" style="color:var(--err);margin-top:6px">${escapeHtml(r.error || '文件被占用')}</div>` : ''}
+        <ul class="checks">${items}</ul>
+      </div>`;
+    }).join('') || '<div class="empty">没有可合并的账号</div>';
+  } catch (e) {
+    $('#mergeBody').innerHTML = `<div class="empty" style="color:var(--err)">合并失败：${escapeHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$('#mode').addEventListener('change', (e) => {
+  const range = e.target.value === 'range';
+  $('#singleBox').style.display = range ? 'none' : '';
+  $('#rangeBox').style.display = range ? '' : 'none';
+  $('#rangeBox2').style.display = range ? '' : 'none';
+  updateScope();
+  refreshPreview();
+});
+['#date', '#start', '#end'].forEach((s) => $(s).addEventListener('change', () => { updateScope(); refreshPreview(); }));
+$('#btnAll').addEventListener('click', () => {
+  document.querySelectorAll('.acc input').forEach((c) => { c.checked = true; state.selected.add(c.value); });
+  updateScope(); refreshPreview();
+});
+$('#btnNone').addEventListener('click', () => {
+  document.querySelectorAll('.acc input').forEach((c) => { c.checked = false; });
+  state.selected.clear(); updateScope(); refreshPreview();
+});
+$('#btnExport').addEventListener('click', runExport);
+$('#btnRealtime').addEventListener('click', refreshRealtime);
+$('#rtAutoChk').addEventListener('change', async (e) => {
+  const on = e.target.checked;
+  try {
+    await api('/api/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ realtime_auto_refresh: on }),
+    });
+    state.cfg = { ...(state.cfg || {}), realtime_auto_refresh: on };
+    setupRtAuto();
+  } catch (err) {
+    e.target.checked = !on;
+    $('#rtAutoHint').textContent = '保存失败：' + err.message;
+  }
+});
+$('#btnRefreshAcc').addEventListener('click', () => refreshAccounts(false));
+$('#btnMerge').addEventListener('click', runMerge);
+$('#btnToggleLog').addEventListener('click', () => showLog(!$('#log').classList.contains('show')));
+$('#btnSaveCfg').addEventListener('click', saveConfig);
+$('#cfgUpdateSource').addEventListener('change', toggleUpdateSource);
+$('#btnDavSave').addEventListener('click', saveDav);
+$('#btnDavTest').addEventListener('click', testDav);
+$('#btnDavClear').addEventListener('click', clearDav);
+$('#btnDavExport').addEventListener('click', exportDavPrivate);
+$('#btnDavPrivateClear').addEventListener('click', clearDavPrivate);
+$('#btnDavUnlock').addEventListener('click', unlockDavPrivate);
+$('#btnDavLock').addEventListener('click', lockDavPrivate);
+$('#btnSideUpdate').addEventListener('click', sideCheckUpdate);
+$('#btnReloadCfg').addEventListener('click', loadConfig);
+$('#btnAddAccount').addEventListener('click', () => openAccountForm(null));
+$('#btnSaveAccount').addEventListener('click', saveAccount);
+$('#btnCancelAccount').addEventListener('click', () => {
+  $('#accFormCard').style.display = 'none';
+  state.editingAccount = null;
+});
+$('#btnPickAccExcel').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  $('#accFormHint').textContent = '已打开文件选择框（若没看到，请查看任务栏）';
+  try {
+    const path = await pickExcelFile($('#accExcel').value, $('#accExcel'), btn);
+    $('#accFormHint').textContent = path ? '已选择：' + path : '已取消选择';
+  } catch (err) {
+    $('#accFormHint').textContent = '选择失败：' + err.message;
+  }
+});
+
+loadConfig();
+loadState().catch((e) => {
+  document.body.insertAdjacentHTML('afterbegin',
+    `<div style="padding:12px;background:#fef2f2;color:#b91c1c">加载失败：${escapeHtml(e.message)}</div>`);
+});
+</script>
+</body>
+</html>
+
