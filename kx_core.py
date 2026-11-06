@@ -1,5 +1,332 @@
-(some characters truncated)...
-else self.ctx.new_page()
+# -*- coding: utf-8 -*-
+"""快手磁力金牛取数核心：配置、登录、账户遍历、商品维度报表
+
+数据链路（与后台页面一致）:
+  投放账户列表 -> 点入账户首页（磁力金牛）
+  -> 在账户页内用页面自带 axios（webpack 模块 50699）调用
+     POST /rest/esp/promotion/report/getDetailReport
+  签名头 esp-sature 由页面拦截器自动生成，无需自行签名
+
+字段口径（已与后台页面逐项核对）:
+  花费   = costTotal / 1000
+  成交   = t0OrderPaymentAmt / 1000      # 总成交订单金额 = 直接 + 间接
+  账户维度 = 该账户当日全部商品行求和
+"""
+from __future__ import annotations
+
+import json
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Iterable
+
+from playwright.sync_api import sync_playwright
+
+import app_secret
+
+# 打包成 exe 后：BASE 取 exe 所在目录（配置/数据/浏览器缓存在这里持久化），
+# 只读资源（web 页面、配置模板）从 PyInstaller 解包目录取。
+if getattr(sys, "frozen", False):
+    BASE = Path(sys.executable).resolve().parent
+    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", BASE))
+else:
+    BASE = Path(__file__).resolve().parent
+    BUNDLE_DIR = BASE
+
+CONFIG_PATH = BASE / "config.json"
+PROFILE_DIR = BASE / ".browser_profile"
+PROFILES_DIR = BASE / ".browser_profiles"
+DATA_DIR = BASE / "data"
+LOGIN_URL = "https://login.kwaixiaodian.com/?biz=zone"
+ACCOUNT_LIST_URL = "https://s.kwaixiaodian.com/zone/ad/account/bid"
+NIU_HOME = "https://niu.e.kuaishou.com/home"
+CST = timezone(timedelta(hours=8))
+
+CHROME_ARGS = [
+    "--no-sandbox",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--disable-features=RendererCodeIntegrity",
+    "--disable-blink-features=AutomationControlled",
+]
+
+# 页面原样使用的商品维度报表列（顺序与后台一致，缺列会导致退化为账户汇总）
+PRODUCT_COLUMNS = [
+    "merchantProductId", "costTotal", "t0OrderPaymentAmt", "t0Roi", "t0OrderCnt", "t0OrderCntCost",
+    "showCnt", "itemEntranceClkCnt", "itemCardClkCnt", "qcpxWhiteboxDirectOrderCnt",
+    "qcpxWhiteboxDirectOrderPaymentAmt", "netT0GMV", "netT0Roi", "netT0OrderCnt", "directGMV",
+    "directOrderCntTotal", "directRoi", "directOrderCntCost", "netDirectGMV", "netDirectOrderCnt",
+    "netDirectRoi", "netOrderPaymentAmtRatio", "directAttrSellerNewBuyerCnt", "t0ShopNewBuyerOrderCnt",
+    "t0ShopNewBuyerOrderPaymentAmt", "qcpxDirectAttrSellerNewBuyerCnt", "qcpxT0ShopNewBuyerOrderCnt",
+    "qcpxT0ShopNewBuyerOrderPaymentAmt", "qcpxMixApportionOrderPenetration",
+    "qcpxMixApportionDirectGmvPenetration", "qcpxDirectOrderSellerBearApportionAmt",
+    "qcpxDirectOrderPlatBearApportionAmt",
+]
+
+FETCH_PRODUCTS_JS = """
+async ([payload, api]) => {
+  if (!window.__wpr) {
+    window.webpackChunkesp.push([[String(Math.random())], {}, function (r) { window.__wpr = r; }]);
+  }
+  if (!window.__wpr) return { ok: false, err: 'webpack require 注入失败' };
+  let mod;
+  try { mod = window.__wpr(50699); } catch (e) { return { ok: false, err: '模块 50699 不可用' }; }
+  if (!mod || !mod.ZP) return { ok: false, err: 'axios 实例不可用' };
+  try {
+    const r = await mod.ZP.post(api, payload);
+    return { ok: true, result: r && r.result, data: (r && r.data) || {} };
+  } catch (e) {
+    return { ok: false, err: (e && (e.msg || e.message)) || String(e) };
+  }
+}
+"""
+
+# 投放账户列表（快手小店后台）：登录后自动获取全量账户
+ACCOUNT_LIST_JS = """
+async (body) => {
+  const r = await fetch('/rest/ad/kwaishop/account/myList', {
+    method: 'POST', credentials: 'include',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  return {status: r.status, text: await r.text()};
+}
+"""
+
+ACCOUNTS_CACHE = DATA_DIR / "accounts_cache.json"
+REALTIME_CACHE = DATA_DIR / "realtime_cache.json"
+
+
+# ---------------------------------------------------------------- config
+def load_config(path: Path | None = None) -> dict:
+    p = path or CONFIG_PATH
+    if not p.exists():
+        tpl = BUNDLE_DIR / "config.example.json"
+        if getattr(sys, "frozen", False) and tpl.exists():
+            # 首次运行：用内置模板生成 config.json（模板里的说明文字不能当账号密码用）
+            data = json.loads(tpl.read_text(encoding="utf-8"))
+            data.pop("account", None)
+            data.pop("password", None)
+            p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        else:
+            raise FileNotFoundError(f"配置文件不存在: {p}")
+    cfg = json.loads(p.read_text(encoding="utf-8"))
+    migrated = _normalize_accounts(cfg)
+    cfg.setdefault("accounts", [])
+    cfg.setdefault("headless", True)
+    cfg.setdefault("date_offset_days", 1)
+    cfg.setdefault("page_size", 100)
+    cfg.setdefault("manual_login_timeout", 600)
+    cfg.setdefault("auto_backup", True)
+    cfg.setdefault("backup_limit", 10)
+    cfg.setdefault("version", "1.1.0")
+    cfg.setdefault("update_repo", "")
+    cfg.setdefault("update_source", "github")
+    cfg.setdefault("update_webdav_path", "/version.json")
+    cfg.setdefault("realtime_auto_refresh", False)
+    cfg.setdefault("realtime_interval_minutes", 5)
+    cfg.setdefault("realtime_window_start", "08:50")
+    cfg.setdefault("realtime_window_end", "18:05")
+    if migrated:
+        try:
+            p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[config] 已自动升级配置结构：登录账号 {len(cfg['accounts'])} 个，密码已加密")
+        except OSError as e:
+            print(f"[config] 配置升级后写回失败: {e}")
+    return cfg
+
+
+def _normalize_accounts(cfg: dict) -> bool:
+    """兼容旧版单账号配置：统一为 accounts[]，并补齐字段、加密明文密码"""
+    changed = False
+    legacy = {
+        "login_account": str(cfg.get("account") or "").strip(),
+        "password": str(cfg.get("password") or ""),
+        "login_role": str(cfg.get("login_role") or "auto"),
+        "excel_path": str(cfg.get("excel_path") or "").strip(),
+        "include_accounts": list(cfg.get("include_accounts") or []),
+        "exclude_accounts": list(cfg.get("exclude_accounts") or []),
+        "alert_thresholds": dict(cfg.get("alert_thresholds") or {}),
+    }
+    has_legacy = any((legacy["login_account"], legacy["password"], legacy["excel_path"]))
+
+    raw = cfg.get("accounts")
+    if not isinstance(raw, list):
+        raw = []
+        changed = True
+    accts = [a for a in raw if isinstance(a, dict)]
+    if len(accts) != len(raw):
+        changed = True
+
+    if not accts and has_legacy:
+        accts = [{
+            "id": "default",
+            "label": "默认账号",
+            "login_account": legacy["login_account"],
+            "password": legacy["password"],
+            "login_role": legacy["login_role"] or "auto",
+            "excel_path": legacy["excel_path"],
+            "enabled": True,
+            "include_accounts": legacy["include_accounts"],
+            "exclude_accounts": legacy["exclude_accounts"],
+            "alert_thresholds": legacy["alert_thresholds"],
+            "legacy_profile": True,
+        }]
+        changed = True
+
+    seen_ids: set[str] = set()
+    for idx, a in enumerate(accts):
+        aid = str(a.get("id") or "")
+        if not aid or aid in seen_ids:
+            a["id"] = "default" if idx == 0 and "default" not in seen_ids else f"acc{idx + 1}"
+            changed = True
+        seen_ids.add(str(a["id"]))
+        if not a.get("label"):
+            a["label"] = str(a.get("login_account") or f"账号 {idx + 1}")
+            changed = True
+        if idx == 0:
+            for k, v in legacy.items():
+                if v and not a.get(k):
+                    a[k] = v
+                    changed = True
+        for k, v in (("login_role", "auto"), ("enabled", True),
+                     ("include_accounts", []), ("exclude_accounts", []),
+                     ("alert_thresholds", {}), ("legacy_profile", False)):
+            if k not in a:
+                a[k] = v
+                changed = True
+        password = str(a.get("password") or "")
+        if password and not app_secret.is_protected(password):
+            try:
+                a["password"] = app_secret.protect_text(password)
+                changed = True
+            except Exception as e:  # noqa: BLE001
+                print(f"[config] 账号密码加密失败（保持明文，请手动重新保存）: {e}")
+
+    if accts and PROFILE_DIR.exists() and not any(a.get("legacy_profile") for a in accts):
+        accts[0]["legacy_profile"] = True
+        changed = True
+
+    if not accts:
+        cfg["accounts"] = []
+    else:
+        cfg["accounts"] = accts
+
+    # 旧版顶层字段迁移完成后移除，避免残留明文密码
+    for k in ("account", "password", "excel_path", "login_role",
+              "include_accounts", "exclude_accounts", "alert_thresholds"):
+        if k in cfg:
+            cfg.pop(k, None)
+            changed = True
+    return changed
+
+
+def default_account_cfg(cfg: dict) -> dict:
+    """CLI 用：取第一个账号的有效配置"""
+    accounts = login_accounts(cfg)
+    return account_cfg(cfg, accounts[0]) if accounts else cfg
+
+
+def login_accounts(cfg: dict) -> list[dict]:
+    return [a for a in (cfg.get("accounts") or [])
+            if isinstance(a, dict) and a.get("id")]
+
+
+def find_login_account(cfg: dict, account_id: str) -> dict | None:
+    for a in login_accounts(cfg):
+        if str(a.get("id")) == str(account_id):
+            return a
+    return None
+
+
+def account_profile_dir(acct: dict) -> Path:
+    """每个登录账号独立浏览器目录；迁移来的第一个账号沿用旧目录保留登录态"""
+    if acct.get("legacy_profile"):
+        return PROFILE_DIR
+    return PROFILES_DIR / str(acct.get("id") or "default")
+
+
+def account_cfg(cfg: dict, acct: dict) -> dict:
+    """把全局配置与某个登录账号合并，供 Client / 导出 / 合并使用"""
+    effective = dict(cfg)
+    effective.update({
+        "account": str(acct.get("login_account") or "").strip(),
+        "password": app_secret.unprotect_text(acct.get("password")),
+        "login_role": str(acct.get("login_role") or "auto"),
+        "excel_path": str(acct.get("excel_path") or ""),
+        "include_accounts": list(acct.get("include_accounts") or []),
+        "exclude_accounts": list(acct.get("exclude_accounts") or []),
+        "alert_thresholds": dict(acct.get("alert_thresholds") or {}),
+        "_account_id": str(acct.get("id")),
+        "_account_label": str(acct.get("label") or acct.get("login_account") or acct.get("id")),
+        "_profile_dir": str(account_profile_dir(acct)),
+        "_cache_owner": None if acct.get("legacy_profile") else str(acct.get("id")),
+    })
+    return effective
+
+
+def resolve_path(v: str) -> Path:
+    p = Path(v)
+    return p if p.is_absolute() else (BASE / p).resolve()
+
+
+def default_date(cfg: dict) -> str:
+    off = int(cfg.get("date_offset_days", 1))
+    return (datetime.now(CST) - timedelta(days=off)).strftime("%Y-%m-%d")
+
+
+def day_range(start: str, end: str) -> list[datetime]:
+    d0 = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=CST)
+    d1 = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=CST)
+    out, cur = [], d0
+    while cur <= d1:
+        out.append(cur)
+        cur += timedelta(days=1)
+    return out
+
+
+# ---------------------------------------------------------------- client
+@dataclass
+class ProductRow:
+    date: str
+    account_id: str
+    account_name: str
+    product_id: str
+    product_name: str
+    cost: float
+    gmv: float
+    order_cnt: int
+    roi: float
+    show_cnt: int
+    click_cnt: int
+
+
+class Client:
+    """磁力金牛后台客户端（Playwright 驱动，复用登录态）"""
+
+    def __init__(self, cfg: dict, logger=print):
+        self.cfg = cfg
+        self.log = logger
+        self._pw = None
+        self.ctx = None
+        self.list_page = None
+
+    # -- lifecycle --------------------------------------------------
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def start(self, headless: bool | None = None):
+        if headless is None:
+            headless = bool(self.cfg.get("headless", True))
+        self._pw = sync_playwright().start()
+        self.ctx = self._launch(headless)
+        self.list_page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
         self.list_page.set_default_timeout(45_000)
         self.ensure_login()
 
@@ -456,4 +783,3 @@ def aggregate(rows: Iterable[ProductRow]) -> list[dict]:
         a["order_cnt"] += r.order_cnt
         a["product_count"] += 1
     return sorted(agg.values(), key=lambda x: (x["date"], x["account_id"]))
-
