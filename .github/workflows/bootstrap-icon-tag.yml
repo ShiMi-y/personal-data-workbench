@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'assets/app.ico.b64'
+      - 'assets/release-version.txt'
   workflow_dispatch:
 
 permissions:
@@ -49,9 +50,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = 'v1.1.0'
+          $version = (Get-Content 'assets/release-version.txt' -Raw).Trim()
+          if (-not $version) { throw 'release-version.txt 为空' }
+          $tag = "v$version"
           $sha = (git rev-parse HEAD).Trim()
-          Write-Host "tag=$tag sha=$sha"
+          Write-Host "version=$version tag=$tag sha=$sha"
           gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag" *> $null
           if ($LASTEXITCODE -eq 0) {
             Write-Host "tag already exists"
