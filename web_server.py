@@ -123,6 +123,23 @@ def _excel_products(path: Path) -> list[dict]:
         return []
 
 
+def _tag_legacy_realtime(data: dict | None, cfg: dict) -> dict | None:
+    """旧版实时缓存没有 owner 字段，归到第一个（迁移）账号"""
+    if not data:
+        return data
+    accounts = kx.login_accounts(cfg)
+    if not accounts:
+        return data
+    owner = next((a for a in accounts if a.get("legacy_profile")), accounts[0])
+    oid, olabel = str(owner.get("id")), str(owner.get("label") or owner.get("id"))
+    for key in ("accounts", "products", "failures", "alerts"):
+        for x in data.get(key) or []:
+            if isinstance(x, dict) and not x.get("owner_id"):
+                x["owner_id"] = oid
+                x["owner_label"] = olabel
+    return data
+
+
 def api_state() -> dict:
     with CFG_LOCK:
         cfg = dict(CFG)
@@ -149,7 +166,7 @@ def api_state() -> dict:
         "webdav_private_unlocked": private["unlocked"],
         "alert_thresholds": thresholds,
         "has_github_token": bool(os.environ.get("GITHUB_TOKEN", "").strip()),
-        "realtime": kx.load_realtime_cache(),
+        "realtime": _tag_legacy_realtime(kx.load_realtime_cache(), cfg),
         "headless": bool(cfg.get("headless", True)),
         "has_credentials": any(a.get("has_password") for a in login_accounts),
         "exports": sorted([p.name for p in (kx.DATA_DIR / "exports").glob("*") if p.is_dir()], reverse=True)[:20]
