@@ -11,6 +11,10 @@ permissions:
   contents: write
   actions: write
 
+concurrency:
+  group: bootstrap-icon-tag
+  cancel-in-progress: true
+
 jobs:
   bootstrap:
     runs-on: windows-latest
