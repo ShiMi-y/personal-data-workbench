@@ -1135,8 +1135,8 @@ function renderRealtime(d) {
     return;
   }
   const ownerSet = state.owners || new Set();
-  const onlySel = ownerSet.size > 0;
-  const visible = (rows) => (rows || []).filter((x) => !onlySel || !x.owner_id || ownerSet.has(String(x.owner_id)));
+  const onlySel = (state.loginAccounts || []).length > 0;
+  const visible = (rows) => (rows || []).filter((x) => !onlySel || ownerSet.has(String(x.owner_id)));
   const accs = visible(d.accounts);
   const prods = visible(d.products);
   const failures = visible(d.failures);
