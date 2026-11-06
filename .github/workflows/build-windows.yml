@@ -70,15 +70,21 @@ jobs:
         env:
           PYTHONUTF8: '1'
         run: |
-          python -m PyInstaller --noconfirm --clean --onedir --windowed `
-            --name "快手数据工作台" `
-            --distpath dist_ci --workpath build_ci `
-            --add-data "web;web" `
-            --add-data "config.example.json;." `
-            --exclude-module PIL --exclude-module pandas --exclude-module matplotlib `
-            --exclude-module tkinter --exclude-module numpy --exclude-module lxml `
-            --exclude-module charset_normalizer `
-            web_server.py
+          $buildArgs = @(
+            '--noconfirm','--clean','--onedir','--windowed',
+            '--name','快手数据工作台',
+            '--distpath','dist_ci','--workpath','build_ci',
+            '--add-data','web;web',
+            '--add-data','config.example.json;.',
+            '--exclude-module','PIL','--exclude-module','pandas','--exclude-module','matplotlib',
+            '--exclude-module','tkinter','--exclude-module','numpy','--exclude-module','lxml',
+            '--exclude-module','charset_normalizer'
+          )
+          if (Test-Path 'assets/app.ico') {
+            $buildArgs += @('--icon','assets/app.ico','--add-data','assets;assets')
+          }
+          $buildArgs += 'web_server.py'
+          python -m PyInstaller @buildArgs
 
       - name: Create zip
         shell: pwsh
