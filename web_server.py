@@ -712,6 +712,8 @@ def api_preview(start: str, end: str, only_accounts: list[str] | None = None,
             "dir": str(d),
             "accounts_csv": str(d / "accounts.csv"),
             "products_csv": str(d / "products.csv"),
+            "products_raw_csv": str(d / "products_raw.csv"),
+            "products_raw_exists": (d / "products_raw.csv").exists(),
             "xlsx": str(d / f"明细_{start}_{end}.xlsx"),
         } for a, d in sources if a is not None],
     }
