@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +36,26 @@ ACCOUNT_HEADER = ["日期", "账户ID", "账户名", "花费", "成交", "成交
 PRODUCT_CSV = ["date", "account_id", "account_name", "product_id", "product_name",
                "cost", "gmv", "order_cnt", "roi", "show_cnt", "click_cnt"]
 ACCOUNT_CSV = ["date", "account_id", "account_name", "cost", "gmv", "order_cnt", "product_count"]
+RAW_BASE = ["date", "account_id", "account_name"]
+
+
+def _raw_header(rows: list[kx.ProductRow]) -> list[str]:
+    """按接口实际返回字段顺序汇总表头（保留原始字段名与原始单位）"""
+    keys: list[str] = []
+    for r in rows:
+        for k in (r.raw or {}).keys():
+            if k not in keys:
+                keys.append(k)
+    return RAW_BASE + keys
+
+
+def _raw_row(r: kx.ProductRow, keys: list[str]) -> list:
+    raw = r.raw or {}
+    out = [r.date, r.account_id, r.account_name]
+    for k in keys:
+        v = raw.get(k)
+        out.append(json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v)
+    return out
 
 
 def _write_csv(path: Path, header: list[str], rows: list[list]):
@@ -44,7 +65,8 @@ def _write_csv(path: Path, header: list[str], rows: list[list]):
         w.writerows(rows)
 
 
-def _write_xlsx(path: Path, acc_rows: list[list], prod_rows: list[list]):
+def _write_xlsx(path: Path, acc_rows: list[list], prod_rows: list[list],
+                raw_header: list[str] | None = None, raw_rows: list[list] | None = None):
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "账户汇总"
@@ -55,7 +77,15 @@ def _write_xlsx(path: Path, acc_rows: list[list], prod_rows: list[list]):
     ws2.append(PRODUCT_HEADER)
     for r in prod_rows:
         ws2.append(r)
-    for ws, widths in ((ws1, [12, 12, 18, 12, 12, 12, 8]), (ws2, [12, 12, 18, 18, 46, 12, 12, 12, 8, 10, 10])):
+    sheets = [(ws1, [12, 12, 18, 12, 12, 12, 8], False),
+              (ws2, [12, 12, 18, 18, 46, 12, 12, 12, 8, 10, 10], False)]
+    if raw_header and raw_rows:
+        ws3 = wb.create_sheet("商品原始数据")
+        ws3.append(raw_header)
+        for r in raw_rows:
+            ws3.append(r)
+        sheets.append((ws3, [12, 14, 20] + [14] * (len(raw_header) - 3), True))
+    for ws, widths, is_raw in sheets:
         for i, w in enumerate(widths, 1):
             ws.column_dimensions[get_column_letter(i)].width = w
         for c in ws[1]:
@@ -65,7 +95,7 @@ def _write_xlsx(path: Path, acc_rows: list[list], prod_rows: list[list]):
         ws.freeze_panes = "A2"
         for row in ws.iter_rows(min_row=1):
             for c in row:
-                if c.column > 4 or ws is ws1:
+                if is_raw or c.column > 4 or ws is ws1:
                     c.alignment = Alignment(horizontal="center")
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
@@ -117,22 +147,32 @@ def run_export(cfg: dict, start: str, end: str, account_ids: list[str] | None = 
 
     _write_csv(outdir / "products.csv", PRODUCT_CSV, prod_rows)
     _write_csv(outdir / "accounts.csv", ACCOUNT_CSV, acc_rows)
+    raw_header = _raw_header(prod)
+    raw_keys = raw_header[len(RAW_BASE):]
+    raw_rows = [_raw_row(r, raw_keys) for r in prod]
+    raw_csv = outdir / "products_raw.csv"
+    if raw_keys:
+        _write_csv(raw_csv, raw_header, raw_rows)
     xlsx = outdir / f"明细_{start}_{end}.xlsx"
-    _write_xlsx(xlsx, acc_rows, prod_rows)
+    _write_xlsx(xlsx, acc_rows, prod_rows,
+                raw_header if raw_keys else None, raw_rows if raw_keys else None)
 
     summary = {
         "start": start, "end": end,
         "outdir": str(outdir),
         "accounts_ok": len({a["account_id"] for a in acc_rows_data}),
         "products": len(prod),
+        "raw_columns": len(raw_keys),
         "total_cost": round(sum(a["cost"] for a in acc_rows_data), 2),
         "total_gmv": round(sum(a["gmv"] for a in acc_rows_data), 2),
         "failures": failures,
-        "files": {"products": str(outdir / "products.csv"), "accounts": str(outdir / "accounts.csv"),
+        "files": {"products": str(outdir / "products.csv"),
+                  "accounts": str(outdir / "accounts.csv"),
+                  "raw": str(raw_csv) if raw_keys else "",
                   "xlsx": str(xlsx)},
     }
     logger(f"[export] 完成：账户 {summary['accounts_ok']}，商品行 {summary['products']}，"
-           f"消耗合计 {summary['total_cost']}，成交合计 {summary['total_gmv']}")
+           f"原始字段 {summary['raw_columns']} 个，消耗合计 {summary['total_cost']}，成交合计 {summary['total_gmv']}")
     if failures:
         logger(f"[export] 失败账户 {len(failures)} 个: {[f['account_id'] for f in failures]}")
     return summary
