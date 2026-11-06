@@ -1310,6 +1310,8 @@ class Handler(BaseHTTPRequestHandler):
                 except RuntimeError as e:
                     return self._json({"error": str(e)}, 400)
                 cfg = _config_snapshot()
+                started_ts = time.time()
+                started_at = time.strftime("%Y-%m-%d %H:%M:%S")
                 results = []
                 for acct in owners:
                     label = acct.get("label") or acct.get("id")
@@ -1331,6 +1333,9 @@ class Handler(BaseHTTPRequestHandler):
                     "results": results,
                     "saved": all(r.get("saved") for r in results) if results else False,
                     "locked": any(r.get("locked") for r in results),
+                    "started_at": started_at,
+                    "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "elapsed": round(time.time() - started_ts, 1),
                 })
 
             return self._json({"error": "not found"}, 404)
