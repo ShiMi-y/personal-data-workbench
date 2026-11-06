@@ -41,6 +41,7 @@ WEB_DIR = kx.BUNDLE_DIR / "web"  # 打包后页面资源在解包目录
 
 CFG = kx.load_config()
 CFG_LOCK = threading.Lock()
+REALTIME_LOCK = threading.Lock()
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 
@@ -465,6 +466,130 @@ def _notify_alerts(alerts: list[dict], logger=None):
     if logger:
         logger(f"[alert] {len(fresh)} 个账户超预警线：" + "；".join(lines))
     app_runtime.notify(f"消耗预警（{len(fresh)} 个账户）", text)
+
+
+def collect_realtime(cfg: dict, owners: list[dict] | None = None, logger=print,
+                     blocking: bool = True) -> dict | None:
+    """抓取一次实时数据并保存缓存/触发预警；供页面任务与后台调度共用"""
+    if not REALTIME_LOCK.acquire(blocking=blocking):
+        return None
+    try:
+        if owners is None:
+            owners = _enabled_login_accounts(cfg)
+        started = time.time()
+        acc_rows, prod_rows, alerts, failures, owners_done = [], [], [], [], []
+        total_cost = total_gmv = total_orders = 0.0
+        for acct in owners:
+            label = acct.get("label") or acct.get("id")
+            logger(f"[实时] 账号「{label}」开始…")
+            try:
+                ecfg = kx.account_cfg(cfg, acct)
+                res = kx.fetch_today(ecfg, None, logger=logger)
+                acc_rows.extend(_tag_accounts(res.get("accounts"), acct))
+                prod_rows.extend(_tag_accounts(res.get("products"), acct))
+                for f in res.get("failures") or []:
+                    failures.append(dict(f, owner_id=str(acct.get("id")), owner_label=label))
+                owner_alerts = _eval_alerts(ecfg, res)
+                for x in owner_alerts:
+                    x["owner_id"] = str(acct.get("id"))
+                    x["owner_label"] = label
+                alerts.extend(owner_alerts)
+                t = res.get("totals") or {}
+                total_cost += float(t.get("cost") or 0)
+                total_gmv += float(t.get("gmv") or 0)
+                total_orders += float(t.get("order_cnt") or 0)
+                owners_done.append({"id": str(acct.get("id")), "label": label, "ok": True})
+            except Exception as e:  # noqa: BLE001
+                logger(f"[实时] 账号「{label}」失败: {type(e).__name__}: {e}")
+                failures.append({"owner_id": str(acct.get("id")), "owner_label": label,
+                                 "account_id": "", "account_name": "", "error": str(e)[:300]})
+                owners_done.append({"id": str(acct.get("id")), "label": label, "ok": False,
+                                    "error": str(e)[:300]})
+
+        if not any(o["ok"] for o in owners_done):
+            raise RuntimeError("全部登录账号实时抓取失败")
+        combined = {
+            "date": kx.today_str(),
+            "fetched_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed": round(time.time() - started, 1),
+            "accounts": acc_rows,
+            "products": prod_rows,
+            "totals": {
+                "cost": round(total_cost, 2),
+                "gmv": round(total_gmv, 2),
+                "roi": round(total_gmv / total_cost, 2) if total_cost else 0,
+                "order_cnt": int(total_orders),
+                "account_rows": len(acc_rows),
+                "product_rows": len(prod_rows),
+            },
+            "failures": failures,
+            "owners": owners_done,
+            "alerts": alerts,
+        }
+        kx.save_realtime_cache(combined)
+        _notify_alerts(alerts, logger=logger)
+        return combined
+    finally:
+        REALTIME_LOCK.release()
+
+
+def _hm_minutes(value, default: str) -> int:
+    try:
+        hh, mm = str(value or default).split(":")
+        return int(hh) * 60 + int(mm)
+    except Exception:  # noqa: BLE001
+        hh, mm = default.split(":")
+        return int(hh) * 60 + int(mm)
+
+
+def _in_realtime_window(cfg: dict) -> bool:
+    tm = time.localtime()
+    cur = tm.tm_hour * 60 + tm.tm_min
+    a = _hm_minutes(cfg.get("realtime_window_start"), "08:50")
+    b = _hm_minutes(cfg.get("realtime_window_end"), "18:05")
+    return a <= cur <= b if a <= b else (cur >= a or cur <= b)
+
+
+def realtime_scheduler_loop():
+    """后台自动刷新：网页关闭、只留托盘时也能按间隔抓取并预警"""
+    last_attempt = 0.0
+    while True:
+        time.sleep(20)
+        cfg = _config_snapshot()
+        if not cfg.get("realtime_auto_refresh"):
+            continue
+        try:
+            interval = max(1, int(cfg.get("realtime_interval_minutes") or 5)) * 60
+        except (TypeError, ValueError):
+            interval = 300
+        now = time.time()
+        if now - last_attempt < interval:
+            continue
+        if not _in_realtime_window(cfg):
+            continue
+        try:
+            cache_age = now - kx.REALTIME_CACHE.stat().st_mtime
+        except OSError:
+            cache_age = interval + 1
+        if cache_age < interval:
+            last_attempt = now
+            continue
+        try:
+            owners = _enabled_login_accounts(cfg)
+        except RuntimeError as e:
+            last_attempt = now
+            print(f"[auto] 跳过自动刷新: {e}")
+            continue
+        last_attempt = now
+        print(f"[auto] 开始自动刷新（{len(owners)} 个账号，间隔 {interval // 60} 分钟）")
+        try:
+            res = collect_realtime(cfg, owners, logger=lambda m: print(f"[auto] {m}"),
+                                   blocking=False)
+            if res is None:
+                print("[auto] 已有实时任务在运行，本轮跳过")
+        except Exception as e:  # noqa: BLE001
+            print(f"[auto] 自动刷新失败: {type(e).__name__}: {e}")
+
 
 
 def api_save_config(body: dict) -> dict:
@@ -1184,60 +1309,13 @@ class Handler(BaseHTTPRequestHandler):
                 jid = _job_new("realtime")
 
                 def work_realtime():
-                    started = time.time()
-                    acc_rows, prod_rows, alerts, failures, owners_done = [], [], [], [], []
-                    total_cost = total_gmv = total_orders = 0.0
-                    for acct in owners:
-                        label = acct.get("label") or acct.get("id")
-                        _job_log(jid, f"[实时] 账号「{label}」开始…")
-                        try:
-                            ecfg = kx.account_cfg(cfg, acct)
-                            res = kx.fetch_today(ecfg, None, logger=lambda m: _job_log(jid, m))
-                            acc_rows.extend(_tag_accounts(res.get("accounts"), acct))
-                            prod_rows.extend(_tag_accounts(res.get("products"), acct))
-                            for f in res.get("failures") or []:
-                                failures.append(dict(f, owner_id=str(acct.get("id")), owner_label=label))
-                            owner_alerts = _eval_alerts(ecfg, res)
-                            for x in owner_alerts:
-                                x["owner_id"] = str(acct.get("id"))
-                                x["owner_label"] = label
-                            alerts.extend(owner_alerts)
-                            t = res.get("totals") or {}
-                            total_cost += float(t.get("cost") or 0)
-                            total_gmv += float(t.get("gmv") or 0)
-                            total_orders += float(t.get("order_cnt") or 0)
-                            owners_done.append({"id": str(acct.get("id")), "label": label, "ok": True})
-                        except Exception as e:  # noqa: BLE001
-                            _job_log(jid, f"[实时] 账号「{label}」失败: {type(e).__name__}: {e}")
-                            failures.append({"owner_id": str(acct.get("id")), "owner_label": label,
-                                             "account_id": "", "account_name": "", "error": str(e)[:300]})
-                            owners_done.append({"id": str(acct.get("id")), "label": label, "ok": False,
-                                                "error": str(e)[:300]})
-
-                    if not any(o["ok"] for o in owners_done):
-                        _job_done(jid, error="全部登录账号实时抓取失败")
-                        return
-                    combined = {
-                        "date": kx.today_str(),
-                        "fetched_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "elapsed": round(time.time() - started, 1),
-                        "accounts": acc_rows,
-                        "products": prod_rows,
-                        "totals": {
-                            "cost": round(total_cost, 2),
-                            "gmv": round(total_gmv, 2),
-                            "roi": round(total_gmv / total_cost, 2) if total_cost else 0,
-                            "order_cnt": int(total_orders),
-                            "account_rows": len(acc_rows),
-                            "product_rows": len(prod_rows),
-                        },
-                        "failures": failures,
-                        "owners": owners_done,
-                        "alerts": alerts,
-                    }
-                    kx.save_realtime_cache(combined)
-                    _notify_alerts(alerts, logger=lambda m: _job_log(jid, m))
-                    _job_done(jid, combined)
+                    try:
+                        combined = collect_realtime(cfg, owners, logger=lambda m: _job_log(jid, m))
+                        _job_done(jid, combined)
+                    except Exception as e:  # noqa: BLE001
+                        _job_log(jid, f"异常: {type(e).__name__}: {e}")
+                        _job_done(jid, error=f"{type(e).__name__}: {e}")
+                        traceback.print_exc()
 
                 threading.Thread(target=work_realtime, daemon=True).start()
                 return self._json({"job_id": jid})
@@ -1371,6 +1449,8 @@ def main():
     print(f"[web] 登录账号 {len(kx.login_accounts(CFG))} 个"
           + ("" if kx.login_accounts(CFG) else "（请先在「账号管理」添加）"))
     app_runtime.cleanup_old_version()
+    threading.Thread(target=realtime_scheduler_loop, daemon=True, name="realtime-auto").start()
+    print("[auto] 后台自动刷新调度已启动（按配置开关/间隔/时段）")
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
 
