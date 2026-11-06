@@ -5,7 +5,7 @@
   py run_daily.py                       # 默认前一自然日
   py run_daily.py 2026-11-04            # 指定单日
   py run_daily.py --start 2026-11-01 --end 2026-11-05
-  py run_daily.py 2026-11-04 --accounts 21373112,20925477
+  py run_daily.py 2026-11-04 --accounts 10000001,10000002
   py run_daily.py 2026-11-04 --no-merge # 只导出不合并
 """
 from __future__ import annotations

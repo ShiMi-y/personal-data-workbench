@@ -9,7 +9,7 @@
 用法:
   py merge_excel.py --date 2026-11-04
   py merge_excel.py --start 2026-11-01 --end 2026-11-05
-  py merge_excel.py --date 2026-11-04 --accounts 21373112,20925477 --dry-run
+  py merge_excel.py --date 2026-11-04 --accounts 10000001,10000002 --dry-run
 """
 from __future__ import annotations
 

@@ -10,7 +10,7 @@
   py export_full.py                      # 前一自然日
   py export_full.py --date 2026-11-04
   py export_full.py --start 2026-11-01 --end 2026-11-05
-  py export_full.py --date 2026-11-04 --accounts 21373112,20925477
+  py export_full.py --date 2026-11-04 --accounts 10000001,10000002
 """
 from __future__ import annotations
 
