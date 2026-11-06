@@ -301,6 +301,7 @@ class ProductRow:
     roi: float
     show_cnt: int
     click_cnt: int
+    raw: dict | None = None
 
 
 class Client:
@@ -587,6 +588,7 @@ class Client:
                     roi=round(float(r.get("t0Roi") or 0), 4),
                     show_cnt=int(r.get("showCnt") or 0),
                     click_cnt=int(r.get("itemEntranceClkCnt") or 0),
+                    raw=dict(r),
                 ))
             total = int(data.get("totalCount") or 0)
             if not chunk or len(rows) >= total:
