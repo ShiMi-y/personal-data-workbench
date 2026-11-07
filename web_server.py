@@ -614,7 +614,7 @@ def api_save_config(body: dict) -> dict:
     if "date_offset_days" in body:
         cfg["date_offset_days"] = _as_int(body["date_offset_days"], "日期偏移", 0, 30)
     if "page_size" in body:
-        cfg["page_size"] = _as_int(body["page_size"], "page_size", 10, 100)
+        cfg["page_size"] = _as_int(body["page_size"], "页面条数", 10, 100)
     if "manual_login_timeout" in body:
         cfg["manual_login_timeout"] = _as_int(body["manual_login_timeout"], "扫码登录等待", 60, 3600)
     if "headless" in body:
@@ -1508,7 +1508,7 @@ def run_updater(ps1: Path, new_root: Path):
         "-AppPid", str(os.getpid()), "-ProgressFile", str(UPDATE_PROGRESS),
         "-LogPath", str(log_path), "-Exe", APP_EXE, "-AliveFile", str(UPDATER_ALIVE),
     ]
-    flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    flags = 0x08000000  # CREATE_NO_WINDOW：DETACHED_PROCESS 会让 powershell 直接退出不执行脚本
     subprocess.Popen(args, creationflags=flags, close_fds=True)
 
 
