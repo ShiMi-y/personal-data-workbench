@@ -44,12 +44,14 @@ CFG_LOCK = threading.Lock()
 REALTIME_LOCK = threading.Lock()
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
+_SINGLE_INSTANCE_MUTEX = None
 
 
 def _job_new(kind: str) -> str:
     jid = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
-        JOBS[jid] = {"id": jid, "kind": kind, "status": "running", "logs": [], "result": None, "error": None}
+        JOBS[jid] = {"id": jid, "kind": kind, "status": "running", "logs": [],
+                     "progress": None, "result": None, "error": None}
     return jid
 
 
@@ -72,6 +74,18 @@ def _job_done(jid: str, result=None, error: str | None = None):
             job["status"] = "error" if error else "done"
             job["result"] = result
             job["error"] = error
+
+
+def _job_progress(jid: str, **fields):
+    """任务进度（更新下载/解压时供网页轮询展示）"""
+    with JOBS_LOCK:
+        job = JOBS.get(jid)
+        if job is None:
+            return
+        prog = dict(job.get("progress") or {})
+        prog.update(fields)
+        prog["updated_at"] = round(time.time(), 2)
+        job["progress"] = prog
 
 
 def _export_dir(start: str, end: str) -> Path:
@@ -359,7 +373,8 @@ CONFIG_KEYS = ("headless", "date_offset_days", "page_size",
                "auto_backup", "backup_limit", "version", "update_repo",
                "update_source", "update_webdav_path",
                "realtime_auto_refresh", "realtime_interval_minutes",
-               "realtime_window_start", "realtime_window_end")
+               "realtime_window_start", "realtime_window_end",
+               "realtime_retry_enabled", "realtime_retry_max")
 
 
 def api_config() -> dict:
@@ -641,6 +656,10 @@ def api_save_config(body: dict) -> dict:
         cfg["realtime_window_start"] = _as_time(body["realtime_window_start"], "自动刷新开始时间")
     if "realtime_window_end" in body:
         cfg["realtime_window_end"] = _as_time(body["realtime_window_end"], "自动刷新结束时间")
+    if "realtime_retry_enabled" in body:
+        cfg["realtime_retry_enabled"] = bool(body["realtime_retry_enabled"])
+    if "realtime_retry_max" in body:
+        cfg["realtime_retry_max"] = _as_int(body["realtime_retry_max"], "失败重试次数", 1, 10)
     if isinstance(body.get("web"), dict):
         web = dict(cfg.get("web") or {})
         if body["web"].get("host"):
@@ -794,6 +813,45 @@ def api_preview(start: str, end: str, only_accounts: list[str] | None = None,
         accs = [a for a in accs if a["account_id"] in only_accounts]
         prods = [p for p in prods if p["account_id"] in only_accounts]
 
+    # 勾选账户即使没进 CSV（未在月度表 / 拉取失败）也要在预览里出现
+    failed: dict[tuple, str] = {}
+    for owner, d in sources:
+        sp = d / "summary.json"
+        if not sp.exists():
+            continue
+        try:
+            sj = json.loads(sp.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        oid = str(owner.get("id")) if owner else ""
+        for f in sj.get("failures") or []:
+            failed[(oid, str(f.get("account_id") or ""))] = str(f.get("error") or "拉取失败")
+
+    have = {(str(a.get("owner_id") or ""), str(a["account_id")) for a in accs}
+    if sources:
+        cached = _cached_accounts(_config_snapshot())
+        want_owners = {str(x) for x in (only_owners or [])}
+        want_ids = {str(x) for x in (only_accounts or [])}
+        for t in cached:
+            oid, aid = str(t.get("owner_id") or ""), str(t.get("id"))
+            if want_owners and oid not in want_owners:
+                continue
+            if want_ids and aid not in want_ids:
+                continue
+            if (oid, aid) in have:
+                continue
+            have.add((oid, aid))
+            accs.append({
+                "date": start if start == end else f"{start}~{end}",
+                "owner_id": oid,
+                "owner_label": t.get("owner_label") or "",
+                "account_id": aid,
+                "account_name": t.get("name") or "",
+                "cost": 0, "gmv": 0, "order_cnt": 0, "product_count": 0, "roi": 0,
+                "failed": True,
+                "error": failed.get((oid, aid), "拉取失败"),
+            })
+
     # 每个账户挂上主商品（消耗最大的那个）
     primary: dict[tuple, tuple] = {}
     for pr in prods:
@@ -846,6 +904,9 @@ def api_preview(start: str, end: str, only_accounts: list[str] | None = None,
 
 APP_EXE = "快手数据工作台.exe"
 UPDATE_DIR = kx.BASE / "updates"
+UPDATE_PROGRESS = UPDATE_DIR / "update_progress.json"
+UPDATER_PS1 = UPDATE_DIR / "apply_update.ps1"
+UPDATER_ALIVE = UPDATE_DIR / "updater_alive.txt"
 
 
 def _ver_tuple(v) -> tuple:
@@ -1019,7 +1080,8 @@ def api_update_check() -> dict:
     return info
 
 
-def _download(cfg: dict, url: str, dst: Path, logger):
+def _download(cfg: dict, url: str, dst: Path, logger, on_progress=None, total_hint=None) -> dict:
+    """下载升级包；on_progress 回调带 downloaded/total/speed/percent（用于网页进度条）"""
     logger("[update] 开始下载升级包…")
     src = str(cfg.get("update_source") or "github").strip().lower()
     if src in ("webdav", "webdav_private"):
@@ -1035,50 +1097,445 @@ def _download(cfg: dict, url: str, dst: Path, logger):
             req.add_header("Authorization", f"Bearer {token}")
             req.add_header("Accept", "application/octet-stream")
         resp = urllib.request.urlopen(req, timeout=120)
+
+    def emit(**kw):
+        if on_progress:
+            on_progress(**kw)
+
     with resp, dst.open("wb") as f:
+        try:
+            total = int(resp.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        if total <= 0:
+            try:
+                total = int(total_hint or 0)
+            except (TypeError, ValueError):
+                total = 0
+        done = 0
+        speed = 0.0
+        started = time.time()
+        last_t, last_done = started, 0
+        emit(downloaded=0, total=total, speed=0, percent=0 if total else None, elapsed=0)
         while True:
-            chunk = resp.read(256 * 1024)
+            chunk = resp.read(64 * 1024)
             if not chunk:
                 break
             f.write(chunk)
-    logger(f"[update] 下载完成 {dst.stat().st_size / 1024 / 1024:.1f} MB")
+            done += len(chunk)
+            now = time.time()
+            if now - last_t >= 0.4:
+                inst = (done - last_done) / (now - last_t)
+                speed = inst if speed <= 0 else speed * 0.7 + inst * 0.3
+                last_t, last_done = now, done
+                emit(downloaded=done, total=total, speed=round(speed, 1),
+                     percent=round(done * 100 / total, 1) if total else None,
+                     elapsed=round(now - started, 1))
+    elapsed = max(0.001, time.time() - started)
+    avg = done / elapsed
+    emit(downloaded=done, total=total or done, speed=round(speed or avg, 1),
+         percent=100 if total else None, elapsed=round(elapsed, 1), done=True)
+    logger(f"[update] 下载完成 {dst.stat().st_size / 1024 / 1024:.1f} MB"
+           f"（{avg / 1024 / 1024:.1f} MB/s，用时 {elapsed:.1f}s）")
+    return {"downloaded": done, "total": total, "speed": round(speed or avg, 1),
+            "avg_speed": round(avg, 1), "elapsed": round(elapsed, 1)}
 
 
-def _write_updater(new_root: Path) -> Path:
-    """生成延迟替换脚本：等本进程退出后换 exe 与 _internal，再启动新版本"""
-    bat = UPDATE_DIR / "apply_update.bat"
-    script = f"""@echo off
-setlocal
-set "APP={kx.BASE}"
-set "NEW={new_root}"
-set "PID={os.getpid()}"
-:wait
-tasklist /FI "PID eq %PID%" 2>nul | find "%PID%" >nul
-if not errorlevel 1 (
-  ping -n 2 127.0.0.1 >nul
-  goto wait
-)
-if exist "%APP%\\_internal.old" rmdir /s /q "%APP%\\_internal.old"
-if exist "%APP%\\_internal" move "%APP%\\_internal" "%APP%\\_internal.old"
-if exist "%NEW%\\_internal" move "%NEW%\\_internal" "%APP%\\_internal"
-if exist "%NEW%\\{APP_EXE}" move /y "%NEW%\\{APP_EXE}" "%APP%\\{APP_EXE}"
-if not exist "%APP%\\_internal" if exist "%APP%\\_internal.old" move "%APP%\\_internal.old" "%APP%\\_internal"
-start "" "%APP%\\{APP_EXE}"
-del "%~f0"
-"""
+def _write_update_progress(**fields):
+    """把升级进度写入 updates/update_progress.json，供独立升级窗口实时读取"""
     try:
-        bat.write_text(script, encoding="mbcs")
+        UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+        data = {k: v for k, v in fields.items() if v is not None}
+        data["ts"] = round(time.time(), 2)
+        tmp = UPDATE_PROGRESS.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, UPDATE_PROGRESS)
+    except Exception as e:  # noqa: BLE001
+        print(f"[update] 写进度文件失败: {type(e).__name__}: {e}")
+
+
+def _clean_update_dir(keep: set[str] | None = None):
+    """清空 updates/ 下的旧包与解压目录，保留升级窗口正在使用的文件"""
+    if not UPDATE_DIR.exists():
+        return
+    keep = keep or set()
+    for p in UPDATE_DIR.iterdir():
+        if p.name in keep:
+            continue
+        try:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+UPDATER_PS1_TEXT = r"""param(
+  [string]$App,
+  [string]$New,
+  [int]$AppPid,
+  [string]$ProgressFile,
+  [string]$LogPath,
+  [string]$Exe = '快手数据工作台.exe',
+  [string]$AliveFile,
+  [switch]$NoGui
+)
+
+$ErrorActionPreference = 'Continue'
+$form = $null
+$lblTitle = $null
+$lblStage = $null
+$lblDetail = $null
+$lblStatus = $null
+$bar = $null
+
+function Write-Log([string]$msg) {
+  try {
+    $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg
+    Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+  } catch { }
+}
+
+function Read-Progress {
+  if (-not (Test-Path -LiteralPath $ProgressFile)) { return $null }
+  try {
+    $raw = Get-Content -LiteralPath $ProgressFile -Raw -Encoding UTF8 -ErrorAction Stop
+    if (-not $raw) { return $null }
+    return ($raw | ConvertFrom-Json)
+  } catch { return $null }
+}
+
+function Format-Size([double]$n) {
+  if ($n -ge 1073741824) { return ('{0:N2} GB' -f ($n / 1073741824.0)) }
+  if ($n -ge 1048576) { return ('{0:N1} MB' -f ($n / 1048576.0)) }
+  if ($n -ge 1024) { return ('{0:N0} KB' -f ($n / 1024.0)) }
+  return ('{0:N0} B' -f $n)
+}
+
+function Set-Stage([string]$stage, [string]$detail, [int]$permille) {
+  if ($null -eq $form) { return }
+  try {
+    if ($stage) { $lblStage.Text = $stage }
+    if ($null -ne $detail) { $lblDetail.Text = $detail }
+    if ($permille -ge 0) {
+      if ($permille -gt 1000) { $permille = 1000 }
+      $bar.Value = $permille
+    }
+    $form.Refresh()
+  } catch { }
+}
+
+function Update-Ui($p) {
+  if ($null -eq $form -or $null -eq $p) { return }
+  $phase = [string]$p.phase
+  $text = [string]$p.text
+  if ($phase -eq 'starting') {
+    Set-Stage '1/4 准备升级' '正在准备升级…' 20
+  } elseif ($phase -eq 'checking') {
+    if ($text) { Set-Stage '1/4 检查更新' $text 60 } else { Set-Stage '1/4 检查更新' '正在检查最新版本…' 60 }
+  } elseif ($phase -eq 'downloading') {
+    $pct = -1.0
+    if ($null -ne $p.percent) { $pct = [double]$p.percent }
+    $dl = [double]$p.downloaded
+    $tot = [double]$p.total
+    $sp = [double]$p.speed
+    $d = '已下载 ' + (Format-Size $dl)
+    if ($tot -gt 0) { $d = $d + ' / ' + (Format-Size $tot) }
+    if ($sp -gt 0) { $d = $d + ' · ' + (Format-Size $sp) + '/s' }
+    $perm = 0
+    if ($pct -ge 0) {
+      $rp = [int][Math]::Round($pct)
+      $d = $d + ' · ' + [string]$rp + '%'
+      $perm = [int][Math]::Round($pct * 7.5)
+    }
+    Set-Stage '2/4 下载升级包' $d $perm
+  } elseif ($phase -eq 'extracting') {
+    $pct = 0.0
+    if ($null -ne $p.percent) { $pct = [double]$p.percent }
+    $ex = [int]$p.extracted
+    $tf = [int]$p.total_files
+    $rp = [int][Math]::Round($pct)
+    $d = '已解压 ' + [string]$ex + ' / ' + [string]$tf + ' 个文件 · ' + [string]$rp + '%'
+    Set-Stage '3/4 解压升级包' $d ([int](750 + $pct * 2.5))
+  } elseif ($phase -eq 'ready') {
+    if ($text) { Set-Stage '4/4 准备替换' $text 1000 } else { Set-Stage '4/4 准备替换' '升级包已就绪…' 1000 }
+  } elseif ($phase -eq 'restarting') {
+    if ($text) { Set-Stage '4/4 重启替换' $text 1000 } else { Set-Stage '4/4 重启替换' '程序即将退出并重启…' 1000 }
+  } elseif ($phase -eq 'failed') {
+    Set-Stage '升级失败' ([string]$p.error) -1
+  }
+}
+
+function Show-Failure([string]$msg) {
+  Write-Log ('失败: ' + $msg)
+  if ($null -ne $form) {
+    try {
+      Set-Stage '升级失败' $msg -1
+      $lblStatus.Text = '日志: ' + $LogPath
+      $form.Refresh()
+    } catch { }
+    $until = (Get-Date).AddSeconds(25)
+    while ((Get-Date) -lt $until) {
+      [System.Windows.Forms.Application]::DoEvents()
+      Start-Sleep -Milliseconds 200
+    }
+  }
+  exit 1
+}
+
+function Remove-WithRetry([string]$path) {
+  for ($i = 0; $i -lt 20; $i++) {
+    try {
+      if (-not (Test-Path -LiteralPath $path)) { return $true }
+      Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+      return $true
+    } catch {
+      Start-Sleep -Milliseconds 600
+    }
+  }
+  return (-not (Test-Path -LiteralPath $path))
+}
+
+function Move-WithRetry([string]$src, [string]$dst) {
+  for ($i = 0; $i -lt 20; $i++) {
+    try {
+      Move-Item -LiteralPath $src -Destination $dst -ErrorAction Stop
+      return $true
+    } catch {
+      Start-Sleep -Milliseconds 600
+    }
+  }
+  return $false
+}
+
+function Copy-WithRetry([string]$src, [string]$dst) {
+  for ($i = 0; $i -lt 20; $i++) {
+    try {
+      Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop
+      return $true
+    } catch {
+      Start-Sleep -Milliseconds 600
+    }
+  }
+  return $false
+}
+
+function Resolve-AppRoot([string]$root) {
+  if (Test-Path -LiteralPath (Join-Path $root $Exe)) { return $root }
+  $dirs = @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)
+  foreach ($d in $dirs) {
+    if (Test-Path -LiteralPath (Join-Path $d.FullName $Exe)) { return $d.FullName }
+  }
+  return $root
+}
+
+Write-Log ('升级器启动 pid=' + [string]$AppPid + ' 安装目录=' + $App)
+if ($AliveFile) {
+  try { Set-Content -LiteralPath $AliveFile -Value ('pid=' + [string]$PID) -Encoding UTF8 } catch { }
+}
+
+if (-not $NoGui) {
+  try {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = '快手数据工作台 · 升级程序'
+    $form.ClientSize = New-Object System.Drawing.Size(440, 170)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedSingle'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ControlBox = $false
+    $form.TopMost = $true
+    $form.BackColor = [System.Drawing.Color]::FromArgb(245, 246, 248)
+    $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+
+    $lblTitle = New-Object System.Windows.Forms.Label
+    $lblTitle.Text = '正在升级快手数据工作台'
+    $lblTitle.Location = New-Object System.Drawing.Point(18, 14)
+    $lblTitle.Size = New-Object System.Drawing.Size(404, 26)
+    $lblTitle.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 12, [System.Drawing.FontStyle]::Bold)
+    $form.Controls.Add($lblTitle)
+
+    $lblStage = New-Object System.Windows.Forms.Label
+    $lblStage.Text = '准备中…'
+    $lblStage.Location = New-Object System.Drawing.Point(18, 50)
+    $lblStage.Size = New-Object System.Drawing.Size(404, 22)
+    $form.Controls.Add($lblStage)
+
+    $bar = New-Object System.Windows.Forms.ProgressBar
+    $bar.Location = New-Object System.Drawing.Point(18, 78)
+    $bar.Size = New-Object System.Drawing.Size(404, 14)
+    $bar.Minimum = 0
+    $bar.Maximum = 1000
+    $bar.Value = 0
+    $form.Controls.Add($bar)
+
+    $lblDetail = New-Object System.Windows.Forms.Label
+    $lblDetail.Text = '等待主程序下载升级包…'
+    $lblDetail.Location = New-Object System.Drawing.Point(18, 100)
+    $lblDetail.Size = New-Object System.Drawing.Size(404, 22)
+    $form.Controls.Add($lblDetail)
+
+    $lblStatus = New-Object System.Windows.Forms.Label
+    $lblStatus.Text = '升级期间请勿关闭此窗口'
+    $lblStatus.Location = New-Object System.Drawing.Point(18, 126)
+    $lblStatus.Size = New-Object System.Drawing.Size(404, 22)
+    $lblStatus.ForeColor = [System.Drawing.Color]::FromArgb(107, 114, 128)
+    $form.Controls.Add($lblStatus)
+
+    $form.Show()
+    $form.Activate()
+    [System.Windows.Forms.Application]::DoEvents()
+    Write-Log '升级窗口已显示'
+  } catch {
+    Write-Log ('升级窗口创建失败: ' + $_.Exception.Message)
+    $form = $null
+  }
+}
+
+$deadline = (Get-Date).AddMinutes(60)
+$p = $null
+while ((Get-Date) -lt $deadline) {
+  $p = Read-Progress
+  if ($null -ne $p) { Update-Ui $p }
+  if ($null -ne $p -and ([string]$p.phase -eq 'ready' -or [string]$p.phase -eq 'restarting')) { break }
+  if ($null -ne $p -and [string]$p.phase -eq 'failed') { Show-Failure ([string]$p.error) }
+  Start-Sleep -Milliseconds 250
+  if ($null -ne $form) { [System.Windows.Forms.Application]::DoEvents() }
+}
+
+if ($null -eq $p -or -not ([string]$p.phase -eq 'ready' -or [string]$p.phase -eq 'restarting')) {
+  Show-Failure '等待升级包超时（60 分钟）'
+}
+
+Write-Log ('升级包就绪，版本=' + [string]$p.latest)
+Set-Stage '4/4 等待主程序退出' '等待旧进程结束后替换文件…' 1000
+
+$alive = $true
+$waitUntil = (Get-Date).AddSeconds(120)
+while ((Get-Date) -lt $waitUntil) {
+  $alive = $false
+  try { $alive = [bool](Get-Process -Id $AppPid -ErrorAction SilentlyContinue) } catch { $alive = $false }
+  if (-not $alive) { break }
+  Start-Sleep -Milliseconds 500
+  if ($null -ne $form) { [System.Windows.Forms.Application]::DoEvents() }
+}
+if ($alive) {
+  Write-Log '等待超时：主程序仍在运行，放弃替换'
+  Show-Failure '主程序没有退出，替换已中止（升级包已下载，可稍后重试）'
+}
+Write-Log '主程序已退出'
+
+$New = Resolve-AppRoot $New
+$internal = Join-Path $App '_internal'
+$oldInternal = Join-Path $App '_internal.old'
+$newInternal = Join-Path $New '_internal'
+$appExe = Join-Path $App $Exe
+$newExe = Join-Path $New $Exe
+
+if (-not (Test-Path -LiteralPath $newInternal) -or -not (Test-Path -LiteralPath $newExe)) {
+  Show-Failure '升级包不完整（缺少新的 _internal 或 exe）'
+}
+
+Set-Stage '4/4 替换程序文件' '正在替换程序文件…' 1000
+
+if (Test-Path -LiteralPath $oldInternal) {
+  Write-Log '清理残留 _internal.old'
+  if (-not (Remove-WithRetry $oldInternal)) { Show-Failure '无法删除 _internal.old（可能仍有进程占用）' }
+}
+
+if (Test-Path -LiteralPath $internal) {
+  Write-Log '重命名 _internal -> _internal.old'
+  if (-not (Move-WithRetry $internal $oldInternal)) { Show-Failure '无法重命名 _internal（可能仍有进程占用）' }
+} else {
+  Write-Log '未发现旧 _internal（按全新安装处理）'
+}
+
+Write-Log '写入新的 _internal'
+if (-not (Move-WithRetry $newInternal $internal)) {
+  if ((Test-Path -LiteralPath $oldInternal) -and -not (Test-Path -LiteralPath $internal)) {
+    Move-WithRetry $oldInternal $internal | Out-Null
+  }
+  Show-Failure '无法写入新 _internal，已回滚旧版本'
+}
+
+Write-Log '替换主程序 exe'
+if (-not (Copy-WithRetry $newExe $appExe)) {
+  Write-Log 'exe 替换失败，回滚 _internal'
+  Remove-WithRetry $internal | Out-Null
+  if (Test-Path -LiteralPath $oldInternal) { Move-WithRetry $oldInternal $internal | Out-Null }
+  Show-Failure '无法替换主程序 exe（可能仍被占用），已回滚旧版本'
+}
+
+Write-Log '替换完成'
+Set-Stage '升级完成' '正在启动新版本…' 1000
+try {
+  Start-Process -FilePath $appExe -WorkingDirectory $App
+  Write-Log '已启动新版本'
+} catch {
+  Write-Log ('启动新版本失败: ' + $_.Exception.Message)
+}
+
+Start-Sleep -Seconds 2
+if ($null -ne $form) { try { $form.Close() } catch { } }
+exit 0
+"""
+
+
+def _write_updater() -> Path:
+    """生成独立升级窗口脚本（PowerShell + WinForms）：显示阶段与进度，并完成替换"""
+    UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        UPDATER_PS1.write_text(UPDATER_PS1_TEXT, encoding="utf-8-sig")
     except Exception:
-        bat.write_text(script, encoding="utf-8")
-    return bat
+        UPDATER_PS1.write_text(UPDATER_PS1_TEXT, encoding="utf-8")
+    return UPDATER_PS1
 
 
-def stage_update(logger=print) -> dict:
-    """下载 + 解压升级包并生成替换脚本（不负责退出进程）"""
+def run_updater(ps1: Path, new_root: Path):
+    """启动独立升级窗口（与主程序脱离，主程序退出后继续替换并重启）"""
+    log_path = app_runtime.LOG_DIR / f"update-{time.strftime('%Y%m%d')}.log"
+    try:
+        UPDATER_ALIVE.unlink(missing_ok=True)
+    except Exception:
+        pass
+    args = [
+        "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-WindowStyle", "Hidden", "-File", str(ps1),
+        "-App", str(kx.BASE), "-New", str(new_root),
+        "-AppPid", str(os.getpid()), "-ProgressFile", str(UPDATE_PROGRESS),
+        "-LogPath", str(log_path), "-Exe", APP_EXE, "-AliveFile", str(UPDATER_ALIVE),
+    ]
+    flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen(args, creationflags=flags, close_fds=True)
+
+
+def _wait_updater_alive(timeout: float = 10.0) -> bool:
+    """等待升级窗口写下启动标记，确认辅助进程真的起来了（否则不退出主程序）"""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if UPDATER_ALIVE.exists():
+                return True
+        except OSError:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def stage_update(logger=print, progress=None) -> dict:
+    """检查 + 下载 + 解压升级包（替换由独立升级窗口负责）"""
+    def emit(**kw):
+        if progress:
+            progress(kw)
+
     with CFG_LOCK:
         cfg = dict(CFG)
     if not (kx.BASE / "_internal").exists():
         raise RuntimeError("当前不是打包运行（缺少 _internal），无法自动升级")
+    emit(phase="checking", text="正在检查最新版本…")
     info = _update_info(cfg)
     if not info["has_update"]:
         raise RuntimeError(f"已是最新版本（v{info['current']}）")
@@ -1086,20 +1543,32 @@ def stage_update(logger=print) -> dict:
     if not asset:
         raise RuntimeError("该 Release 未上传 zip 升级包")
 
-    if UPDATE_DIR.exists():
-        for p in UPDATE_DIR.iterdir():
-            if p.is_dir():
-                shutil.rmtree(p, ignore_errors=True)
-            else:
-                p.unlink(missing_ok=True)
+    _clean_update_dir({UPDATER_PS1.name, UPDATE_PROGRESS.name, UPDATER_ALIVE.name})
     UPDATE_DIR.mkdir(parents=True, exist_ok=True)
 
     zip_path = UPDATE_DIR / asset["name"]
-    _download(cfg, asset["url"], zip_path, logger)
+    try:
+        expected = int(asset.get("size") or 0)
+    except (TypeError, ValueError):
+        expected = 0
+    emit(phase="downloading", downloaded=0, total=expected, speed=0,
+         percent=0 if expected else None, elapsed=0)
+    dl = _download(cfg, asset["url"], zip_path, logger,
+                   on_progress=lambda **kw: emit(phase="downloading", **kw),
+                   total_hint=expected)
 
     new_dir = UPDATE_DIR / "new"
     with zipfile.ZipFile(zip_path) as z:
-        z.extractall(new_dir)
+        members = z.infolist()
+        total_files = len(members) or 1
+        emit(phase="extracting", extracted=0, total_files=total_files, percent=0,
+             downloaded=dl["downloaded"], total=dl["total"])
+        for i, m in enumerate(members, 1):
+            z.extract(m, new_dir)
+            if i % 40 == 0 or i == total_files:
+                emit(phase="extracting", extracted=i, total_files=total_files,
+                     percent=round(i * 100 / total_files, 1),
+                     downloaded=dl["downloaded"], total=dl["total"])
     root = new_dir
     if not (root / APP_EXE).exists():
         subs = [p for p in new_dir.iterdir() if p.is_dir()]
@@ -1108,19 +1577,13 @@ def stage_update(logger=print) -> dict:
     if not (root / APP_EXE).exists() or not (root / "_internal").exists():
         raise RuntimeError("升级包里缺少 exe 或 _internal，已中止")
 
-    bat = _write_updater(root)
+    emit(phase="ready", percent=100, text="升级包已就绪，准备重启…")
     logger(f"[update] 升级包就绪（v{info['latest']}），即将重启替换")
     return {
         "current": info["current"],
         "latest": info["latest"],
         "install_dir": str(kx.BASE),
-        "script": str(bat),
     }
-
-
-def run_updater(bat: Path):
-    flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen(["cmd", "/c", str(bat)], creationflags=flags, close_fds=True)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1366,13 +1829,25 @@ class Handler(BaseHTTPRequestHandler):
                 print("[update] 收到升级请求")
 
                 def work_update():
+                    def on_prog(p):
+                        _job_progress(jid, **p)
+                        _write_update_progress(**p)
+
                     try:
-                        res = stage_update(logger=lambda m: _job_log(jid, m))
-                        run_updater(Path(res["script"]))
-                        _job_log(jid, "[update] 替换脚本已启动，程序将在约 3 秒后退出并重启")
-                        _job_done(jid, {k: v for k, v in res.items() if k != "script"})
+                        _write_update_progress(phase="starting", percent=0, text="正在准备升级…")
+                        run_updater(_write_updater(), UPDATE_DIR / "new")
+                        if not _wait_updater_alive():
+                            raise RuntimeError("升级窗口没有启动成功（可能被安全软件拦截），已取消本次升级")
+                        _job_log(jid, "[update] 升级窗口已启动，开始下载升级包…")
+                        res = stage_update(logger=lambda m: _job_log(jid, m), progress=on_prog)
+                        _write_update_progress(phase="restarting", percent=100, latest=res["latest"],
+                                               text="升级包已就绪，程序即将退出并重启…")
+                        _job_log(jid, "[update] 替换程序已就绪，程序将在约 3 秒后退出并重启")
+                        _job_done(jid, dict(res))
                         app_runtime.quit_app(3.0)
                     except Exception as e:  # noqa: BLE001
+                        _write_update_progress(phase="failed", text="升级失败",
+                                               error=f"{type(e).__name__}: {e}")
                         _job_log(jid, f"升级失败: {type(e).__name__}: {e}")
                         _job_done(jid, error=f"{type(e).__name__}: {e}")
                         traceback.print_exc()
@@ -1399,13 +1874,14 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         res = merge_excel.run_merge(
                             ecfg, start, end, mapping.get(str(acct.get("id"))),
-                            export_dir=_owner_export_dir(start, end, str(acct.get("id"))),
+                            export_dir=_owner_export_dir(start, end, acct),
                             backup=bool(cfg.get("auto_backup", True)))
                         print(f"[merge] 账号「{label}」完成: written={res.get('written')} "
                               f"saved={res.get('saved')} locked={res.get('locked')}")
                         results.append(dict(res, owner_id=str(acct.get("id")), owner_label=label))
                     except Exception as e:  # noqa: BLE001
                         print(f"[merge] 账号「{label}」失败: {type(e).__name__}: {e}")
+                        traceback.print_exc()
                         results.append({"owner_id": str(acct.get("id")), "owner_label": label,
                                         "error": f"{type(e).__name__}: {e}", "saved": False,
                                         "locked": False, "written": 0, "checks": []})
@@ -1425,6 +1901,29 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": f"{type(e).__name__}: {e}"}, 500)
 
 
+def _already_running(url: str) -> bool:
+    """单实例检查：Windows 用命名互斥量，其他平台退回接口探测"""
+    global _SINGLE_INSTANCE_MUTEX
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+            handle = kernel32.CreateMutexW(None, False, "Local\\KuaishouDataWorkbench")
+            if not handle:
+                return False
+            _SINGLE_INSTANCE_MUTEX = handle  # 进程存活期间保持句柄，退出自动释放
+            return ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+        except Exception:
+            return False
+    try:
+        with urllib.request.urlopen(url + "api/state", timeout=1.5) as r:
+            return 200 <= r.status < 300
+    except Exception:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host")
@@ -1437,6 +1936,12 @@ def main():
     host = args.host or web.get("host", "127.0.0.1")
     port = args.port or int(web.get("port", 8765))
     url = f"http://{host}:{port}/"
+
+    if _already_running(url):
+        print("[web] 已有实例在运行，改为打开浏览器")
+        if not args.no_browser:
+            webbrowser.open(url)
+        return
 
     try:
         srv = ThreadingHTTPServer((host, port), Handler)
