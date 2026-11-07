@@ -827,7 +827,7 @@ def api_preview(start: str, end: str, only_accounts: list[str] | None = None,
         for f in sj.get("failures") or []:
             failed[(oid, str(f.get("account_id") or ""))] = str(f.get("error") or "拉取失败")
 
-    have = {(str(a.get("owner_id") or ""), str(a["account_id")) for a in accs}
+    have = {(str(a.get("owner_id") or ""), str(a["account_id"])) for a in accs}
     if sources:
         cached = _cached_accounts(_config_snapshot())
         want_owners = {str(x) for x in (only_owners or [])}
