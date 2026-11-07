@@ -1,0 +1,119 @@
+name: Build Windows package
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（留空则读取 config.example.json）'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller==6.21.0 openpyxl playwright cryptography
+
+      - name: Resolve version
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.version }}".Trim()
+          if (-not $version -and "${{ github.ref_type }}" -eq 'tag') {
+            $version = "${{ github.ref_name }}".TrimStart('v')
+          }
+          if (-not $version) {
+            $version = (Get-Content config.example.json -Raw | ConvertFrom-Json).version
+          }
+          if (-not $version) { throw '无法确定版本号' }
+          $zipName = "personal-data-workbench-v$version-win64.zip"
+          Add-Content -Path $env:GITHUB_ENV -Value "APP_VERSION=$version" -Encoding ascii
+          Add-Content -Path $env:GITHUB_ENV -Value "ZIP_NAME=$zipName" -Encoding ascii
+          $env:ZIP_NAME = $zipName
+          Write-Host "version=$version"
+          Write-Host "zip=$zipName"
+
+      - name: Sync version into source
+        shell: pwsh
+        run: |
+          $p = 'kx_core.py'
+          $c = Get-Content $p -Raw
+          $replacement = 'APP_VERSION = "' + $env:APP_VERSION + '"'
+          $c = $c -replace 'APP_VERSION = "[^"]*"', $replacement
+          Set-Content -Path $p -Value $c -Encoding utf8
+          Select-String -Path $p -Pattern 'APP_VERSION' | Select-Object -First 1
+
+      - name: Build with PyInstaller
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+        run: |
+          $buildArgs = @(
+            '--noconfirm','--clean','--onedir','--windowed',
+            '--name','快手数据工作台',
+            '--distpath','dist_ci','--workpath','build_ci',
+            '--add-data','web;web',
+            '--add-data','config.example.json;.',
+            '--exclude-module','PIL','--exclude-module','pandas','--exclude-module','matplotlib',
+            '--exclude-module','tkinter','--exclude-module','numpy','--exclude-module','lxml',
+            '--exclude-module','charset_normalizer'
+          )
+          if (Test-Path 'assets/app.ico') {
+            $buildArgs += @('--icon','assets/app.ico','--add-data','assets;assets')
+          }
+          $buildArgs += 'web_server.py'
+          python -m PyInstaller @buildArgs
+
+      - name: Create zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Compress-Archive -Path "dist_ci\快手数据工作台\快手数据工作台.exe", "dist_ci\快手数据工作台\_internal" `
+            -DestinationPath "release\$env:ZIP_NAME" -CompressionLevel Optimal
+          Get-Item "release\$env:ZIP_NAME" | Select-Object Name, Length
+          (Get-FileHash "release\$env:ZIP_NAME" -Algorithm SHA256).Hash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: personal-data-workbench-windows
+          path: release/*.zip
+          retention-days: 14
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $asset = "release\$env:ZIP_NAME"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $asset --clobber
+          } else {
+            gh release create $tag $asset --title $tag --generate-notes
+          }
+

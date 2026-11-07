@@ -1,0 +1,65 @@
+name: Bootstrap icon and tag
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'assets/app.ico.b64'
+      - 'assets/release-version.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: bootstrap-icon-tag
+  cancel-in-progress: true
+
+jobs:
+  bootstrap:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decode app.ico
+        shell: pwsh
+        run: |
+          $b64 = (Get-Content 'assets/app.ico.b64' -Raw).Trim()
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'assets/app.ico'), [Convert]::FromBase64String($b64))
+          Get-Item 'assets/app.ico' | Select-Object Name, Length
+
+      - name: Commit app.ico
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add assets/app.ico
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "chore: add app icon"
+            git push
+          }
+
+      - name: Create tag and trigger build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content 'assets/release-version.txt' -Raw).Trim()
+          if (-not $version) { throw 'release-version.txt 为空' }
+          $tag = "v$version"
+          $sha = (git rev-parse HEAD).Trim()
+          Write-Host "version=$version tag=$tag sha=$sha"
+          gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "tag already exists"
+          } else {
+            gh api "repos/$env:GITHUB_REPOSITORY/git/refs" --method POST -f ref="refs/tags/$tag" -f sha="$sha"
+          }
+          gh workflow run build-windows.yml --ref $tag
+

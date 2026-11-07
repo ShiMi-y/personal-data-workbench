@@ -1,0 +1,20 @@
+# 本地敏感文件：不要提交
+config.json
+webdav_secret.dat
+webdav_private.dat
+.browser_profile/
+.browser_profiles/
+data/
+logs/
+*.log
+__pycache__/
+# 打包与发布产物
+dist/
+dist_*/
+dist.rar
+build/
+build_*/
+*.spec
+release/
+updates/
+
