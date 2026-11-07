@@ -116,6 +116,8 @@ def run_export(cfg: dict, start: str, end: str, account_ids: list[str] | None = 
         if not accounts:
             raise RuntimeError("没有可导出的账户（检查登录态或 include/exclude 配置）")
         logger(f"[export] 账户全量 {len(all_accounts)} 个，本次导出 {len(accounts)} 个 × {len(days)} 天 -> {outdir}")
+        accounts_meta = [{"account_id": str(a["id"]), "account_name": a.get("name") or ""}
+                         for a in accounts]
 
         for acc in accounts:
             aid, aname = str(acc["id"]), acc.get("name") or ""
@@ -175,6 +177,13 @@ def run_export(cfg: dict, start: str, end: str, account_ids: list[str] | None = 
            f"原始字段 {summary['raw_columns']} 个，消耗合计 {summary['total_cost']}，成交合计 {summary['total_gmv']}")
     if failures:
         logger(f"[export] 失败账户 {len(failures)} 个: {[f['account_id'] for f in failures]}")
+    summary["accounts_requested"] = accounts_meta
+    try:
+        # 供网页预览：勾选但无数据/失败的账户也能展示
+        (outdir / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
     return summary
 
 
@@ -200,4 +209,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
