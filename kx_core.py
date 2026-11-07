@@ -37,7 +37,7 @@ else:
     BUNDLE_DIR = BASE
 
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.7"
 PROFILE_DIR = BASE / ".browser_profile"
 PROFILES_DIR = BASE / ".browser_profiles"
 DATA_DIR = BASE / "data"
@@ -101,6 +101,32 @@ ACCOUNTS_CACHE = DATA_DIR / "accounts_cache.json"
 REALTIME_CACHE = DATA_DIR / "realtime_cache.json"
 
 
+def _account_page(data) -> tuple[list[dict], int | None]:
+    """解析 myList 的分页返回：账户数组 + 总数（字段名各接口不统一）"""
+    if isinstance(data, list):
+        return data, None
+    if not isinstance(data, dict):
+        return [], None
+    items: list[dict] = []
+    for k in ("list", "records", "rows", "dataList", "pageData", "items"):
+        v = data.get(k)
+        if isinstance(v, list):
+            items = v
+            break
+    total = None
+    for k in ("total", "totalCount", "totalSize", "totalNum", "count"):
+        v = data.get(k)
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, int):
+            total = v
+            break
+        if isinstance(v, str) and v.isdigit():
+            total = int(v)
+            break
+    return items, total
+
+
 # ---------------------------------------------------------------- config
 def load_config(path: Path | None = None) -> dict:
     p = path or CONFIG_PATH
@@ -131,6 +157,8 @@ def load_config(path: Path | None = None) -> dict:
     cfg.setdefault("realtime_interval_minutes", 5)
     cfg.setdefault("realtime_window_start", "08:50")
     cfg.setdefault("realtime_window_end", "18:05")
+    cfg.setdefault("realtime_retry_enabled", True)
+    cfg.setdefault("realtime_retry_max", 3)
     if migrated:
         try:
             p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -489,23 +517,28 @@ class Client:
             page.wait_for_timeout(3000)
         out, seen = [], set()
         page_size = 100
-        for page_no in range(1, 21):
+        total = None
+        pages = 0
+        for page_no in range(1, 201):
             payload = {"pageSize": page_size, "current": page_no,
                        "queryActiveFlag": False, "pageNo": page_no}
             res = page.evaluate(ACCOUNT_LIST_JS, payload)
             if not res or res.get("status") != 200:
                 raise RuntimeError(f"账户列表接口异常: HTTP {(res or {}).get('status')}")
             j = json.loads(res.get("text") or "{}")
-            items = j.get("data")
-            if isinstance(items, dict):
-                items = items.get("list") or items.get("records") or []
-            if not isinstance(items, list):
-                raise RuntimeError(f"账户列表返回结构异常: {str(j)[:200]}")
+            items, page_total = _account_page(j.get("data"))
+            if page_total is not None and total is None:
+                total = page_total
+            if not items:
+                break
+            pages = page_no
+            new = 0
             for it in items:
                 aid = it.get("accountId")
                 if aid is None or str(aid) in seen:
                     continue
                 seen.add(str(aid))
+                new += 1
                 out.append({
                     "id": str(aid),
                     "name": it.get("accountName") or "",
@@ -513,10 +546,63 @@ class Client:
                     "status": it.get("reviewStatusName") or "",
                     "corp": it.get("corpName") or "",
                 })
-            if len(items) < page_size:
+            if total is not None and len(out) >= total:
                 break
+            # 服务端会把 pageSize 压到默认值（如 15/20），不能再用 len(items) < page_size 判断结束；
+            # 只有整页没出现新账户（分页参数未生效）才停，避免死循环
+            if new == 0:
+                break
+        if total is not None and len(out) < total:
+            print(f"[accounts] 账户列表分页未取全: {len(out)}/{total}，接口可能未按页返回")
+        else:
+            print(f"[accounts] 账户列表共 {len(out)} 个（{pages} 页）")
         save_accounts_cache(out, self.cfg.get("_cache_owner"))
         return out
+
+    def _locate_account_row(self, page, account_id: str):
+        """在账户列表定位某账户行：当前页 → 搜索框 → 逐页翻页"""
+        row = page.locator("tr", has_text=str(account_id)).first
+        if row.count() > 0:
+            return row
+
+        box = page.locator('input[placeholder*="账户"]').first
+        if box.count() == 0:
+            box = page.locator('input[placeholder*="搜索"]').first
+        if box.count() > 0:
+            try:
+                box.fill(str(account_id))
+                box.press("Enter")
+                page.wait_for_timeout(2500)
+                row = page.locator("tr", has_text=str(account_id)).first
+                if row.count() > 0:
+                    self.log(f"[accounts] 通过搜索定位账户 {account_id}")
+                    return row
+            except Exception:
+                pass
+
+        prev_first = ""
+        for _ in range(10):
+            try:
+                nxt = page.locator("li[title='下一页'], button[aria-label='下一页'], "
+                                   ".ant-pagination-next, .semi-page-next").first
+                if nxt.count() == 0:
+                    break
+                first_txt = page.locator("tbody tr").first.inner_text()[:80]
+            except Exception:
+                break
+            if first_txt == prev_first:
+                break
+            prev_first = first_txt
+            try:
+                nxt.click(timeout=5000)
+                page.wait_for_timeout(1800)
+            except Exception:
+                break
+            row = page.locator("tr", has_text=str(account_id)).first
+            if row.count() > 0:
+                self.log(f"[accounts] 翻页定位账户 {account_id}")
+                return row
+        return None
 
     def open_account(self, account_id: str):
         """从列表页点入账户首页，返回新页；调用方负责 close"""
@@ -525,8 +611,8 @@ class Client:
             page.goto(ACCOUNT_LIST_URL, wait_until="domcontentloaded", timeout=60_000)
             page.wait_for_timeout(3000)
         page.bring_to_front()
-        row = page.locator("tr", has_text=str(account_id)).first
-        if row.count() == 0:
+        row = self._locate_account_row(page, str(account_id))
+        if row is None:
             raise RuntimeError(f"账户列表未找到 {account_id}")
         with self.ctx.expect_page(timeout=30_000) as info:
             row.locator("p.ad-shop-account-text-with-id-text-navigate").first.click()
@@ -660,7 +746,15 @@ def pick_accounts(all_accounts: list[dict], cfg: dict, ids: list[str] | None = N
 
     if ids:
         wanted = {str(x) for x in ids}
-        return [a for a in pool if a["id"] in wanted]
+        picked = [a for a in pool if a["id"] in wanted]
+        got = {a["id"] for a in picked}
+        # 接口列表里没返回的账户也保留：勾选过的账户都要尝试拉取并在预览里出现
+        for x in ids:
+            sid = str(x)
+            if sid not in got:
+                picked.append({"id": sid, "name": ""})
+                got.add(sid)
+        return picked
 
     include = cfg.get("include_accounts") or []
     if include:
@@ -705,25 +799,42 @@ def fetch_today(cfg: dict, account_ids: list[str] | None = None, logger=print) -
         accounts = pick_accounts(all_accounts, cfg, account_ids)
         if not accounts:
             raise RuntimeError("没有可查询的账户（检查登录态或 include/exclude 配置）")
-        logger(f"[实时] 账户 {len(accounts)} 个，查询日期 {day:%Y-%m-%d}")
+        try:
+            retry_max = max(0, min(int(cfg.get("realtime_retry_max") or 3), 10))
+        except (TypeError, ValueError):
+            retry_max = 3
+        if not cfg.get("realtime_retry_enabled"):
+            retry_max = 0
+        logger(f"[实时] 账户 {len(accounts)} 个，查询日期 {day:%Y-%m-%d}"
+               + (f"，失败最多重试 {retry_max} 次" if retry_max else "，不重试"))
         for acc in accounts:
             aid, aname = str(acc["id"]), acc.get("name") or ""
-            home = None
-            try:
-                home = client.open_account(aid)
-                rows = client.fetch_products(home, aid, aname, day)
-                prod.extend(rows)
-                logger(f"    {aname or aid} 商品 {len(rows)} 个 花费 {round(sum(r.cost for r in rows), 2)} "
-                       f"成交 {round(sum(r.gmv for r in rows), 2)}")
-            except Exception as e:  # noqa: BLE001
-                logger(f"    {aname or aid} 失败: {type(e).__name__}: {e}")
-                failures.append({"account_id": aid, "account_name": aname, "error": str(e)[:300]})
-            finally:
-                if home is not None:
-                    try:
-                        home.close()
-                    except Exception:
-                        pass
+            attempt = 0
+            while True:
+                home = None
+                try:
+                    home = client.open_account(aid)
+                    rows = client.fetch_products(home, aid, aname, day)
+                    prod.extend(rows)
+                    logger(f"    {aname or aid} 商品 {len(rows)} 个 花费 {round(sum(r.cost for r in rows), 2)} "
+                           f"成交 {round(sum(r.gmv for r in rows), 2)}")
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if attempt >= retry_max:
+                        logger(f"    {aname or aid} 失败: {type(e).__name__}: {e}"
+                               + (f"（已重试 {attempt} 次）" if attempt else ""))
+                        failures.append({"account_id": aid, "account_name": aname,
+                                         "error": str(e)[:300], "attempts": attempt + 1})
+                        break
+                    attempt += 1
+                    logger(f"    {aname or aid} 第 {attempt}/{retry_max} 次重试: {type(e).__name__}: {e}")
+                    time.sleep(min(2 * attempt, 6))
+                finally:
+                    if home is not None:
+                        try:
+                            home.close()
+                        except Exception:
+                            pass
 
     agg = aggregate(prod)
     total_cost = round(sum(a["cost"] for a in agg), 2)
