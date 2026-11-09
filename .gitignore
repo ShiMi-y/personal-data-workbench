@@ -1,5 +1,6 @@
 # 本地敏感文件：不要提交
 config.json
+config.json.bak*
 webdav_secret.dat
 webdav_private.dat
 .browser_profile/

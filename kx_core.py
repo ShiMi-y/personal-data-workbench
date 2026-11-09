@@ -38,7 +38,7 @@ else:
     BUNDLE_DIR = BASE
 
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "1.2.9"
+APP_VERSION = "1.3.0"
 PROFILE_DIR = BASE / ".browser_profile"
 PROFILES_DIR = BASE / ".browser_profiles"
 DATA_DIR = BASE / "data"
@@ -181,6 +181,7 @@ def _normalize_accounts(cfg: dict) -> bool:
         "password": str(cfg.get("password") or ""),
         "login_role": str(cfg.get("login_role") or "auto"),
         "excel_path": str(cfg.get("excel_path") or "").strip(),
+        "roi_book_path": str(cfg.get("roi_book_path") or "").strip(),
         "include_accounts": list(cfg.get("include_accounts") or []),
         "exclude_accounts": list(cfg.get("exclude_accounts") or []),
         "alert_thresholds": dict(cfg.get("alert_thresholds") or {}),
@@ -203,6 +204,7 @@ def _normalize_accounts(cfg: dict) -> bool:
             "password": legacy["password"],
             "login_role": legacy["login_role"] or "auto",
             "excel_path": legacy["excel_path"],
+            "roi_book_path": legacy["roi_book_path"],
             "enabled": True,
             "include_accounts": legacy["include_accounts"],
             "exclude_accounts": legacy["exclude_accounts"],
@@ -228,7 +230,8 @@ def _normalize_accounts(cfg: dict) -> bool:
                     changed = True
         for k, v in (("login_role", "auto"), ("enabled", True),
                      ("include_accounts", []), ("exclude_accounts", []),
-                     ("alert_thresholds", {}), ("legacy_profile", False)):
+                     ("alert_thresholds", {}), ("legacy_profile", False),
+                     ("roi_book_path", "")):
             if k not in a:
                 a[k] = v
                 changed = True
@@ -253,7 +256,7 @@ def _normalize_accounts(cfg: dict) -> bool:
         cfg["accounts"] = accts
 
     # 旧版顶层字段迁移完成后移除，避免残留明文密码
-    for k in ("account", "password", "excel_path", "login_role",
+    for k in ("account", "password", "excel_path", "roi_book_path", "login_role",
               "include_accounts", "exclude_accounts", "alert_thresholds"):
         if k in cfg:
             cfg.pop(k, None)
@@ -300,6 +303,8 @@ def account_cfg(cfg: dict, acct: dict) -> dict:
         "password": app_secret.unprotect_text(acct.get("password")),
         "login_role": str(acct.get("login_role") or "auto"),
         "excel_path": str(acct.get("excel_path") or ""),
+        "roi_book_path": str(acct.get("roi_book_path") or ""),
+        "week_cost_source": str(acct.get("week_cost_source") or "both"),
         "include_accounts": list(acct.get("include_accounts") or []),
         "exclude_accounts": list(acct.get("exclude_accounts") or []),
         "alert_thresholds": dict(acct.get("alert_thresholds") or {}),
@@ -399,11 +404,22 @@ class Client:
         self.list_page.set_default_timeout(45_000)
 
     def close(self):
-        for obj, name in ((self.ctx, "ctx"), (self._pw, "pw")):
-            try:
-                obj.close() if name == "ctx" else obj.stop()
-            except Exception:
-                pass
+        """关闭浏览器；ctx.close 偶发卡住，加超时避免整个流程挂死"""
+        import threading
+        if self.ctx is not None:
+            def _close_ctx():
+                try:
+                    self.ctx.close()
+                except Exception:
+                    pass
+            t = threading.Thread(target=_close_ctx, daemon=True)
+            t.start()
+            t.join(20)
+        try:
+            if self._pw is not None:
+                self._pw.stop()
+        except Exception:
+            pass
 
     # -- login ------------------------------------------------------
     def ensure_login(self):
@@ -641,6 +657,76 @@ class Client:
         return False
 
     # -- report -----------------------------------------------------
+    def fetch_products_range(self, page, account_id: str, account_name: str,
+                             start: datetime, end: datetime,
+                             retries: int = 3) -> list[ProductRow]:
+        """一次请求取整个区间（groupType=1 返回按天明细，每行带 reportDate）"""
+        begin = int(start.timestamp() * 1000)
+        end_ms = int(end.timestamp() * 1000) + 86_399_999
+        page_size = int(self.cfg.get("page_size", 100))
+        rows: list[ProductRow] = []
+        raw_seen = 0
+        total = 0
+        page_no = 1
+        while page_no <= 1000:
+            payload = {
+                "bizType": 2,
+                "reportSceneType": 19321,
+                "selectColumn": PRODUCT_COLUMNS,
+                "whereCondition": [{"name": "sceneOrientedType", "values": ["24"], "compareOp": 0}],
+                "sortCondition": [],
+                "timeCondition": {"beginTime": begin, "endTime": end_ms, "groupType": 1},
+                "havingCondition": [],
+                "pageInfo": {"currentPage": page_no, "pageSize": page_size, "totalCount": 0},
+                "bizSubType": 22,
+                "viewType": 1,
+            }
+            res = None
+            for attempt in range(retries):
+                try:
+                    res = page.evaluate(FETCH_PRODUCTS_JS, [payload, "/promotion/report/getDetailReport"])
+                except Exception as e:  # noqa: BLE001
+                    res = {"ok": False, "err": f"{type(e).__name__}: {e}"}
+                if res and res.get("ok"):
+                    break
+                page.wait_for_timeout(800 * (attempt + 1))
+            if not res or not res.get("ok"):
+                raise RuntimeError(f"{account_id} 区间取数失败: {(res or {}).get('err')}")
+
+            data = res.get("data") or {}
+            chunk = data.get("detail") or []
+            for r in chunk:
+                pid = r.get("merchantProductId")
+                if not pid:
+                    continue
+                d = str(r.get("reportDate") or r.get("reportDateStr") or "")[:10]
+                if not d:
+                    continue
+                rows.append(ProductRow(
+                    date=d,
+                    account_id=str(account_id),
+                    account_name=account_name,
+                    product_id=str(pid),
+                    product_name=(r.get("itemName") or "").strip(),
+                    cost=round((r.get("costTotal") or 0) / 1000, 2),
+                    gmv=round((r.get("t0OrderPaymentAmt") or 0) / 1000, 2),
+                    order_cnt=int(r.get("t0OrderCnt") or 0),
+                    roi=round(float(r.get("t0Roi") or 0), 4),
+                    show_cnt=int(r.get("showCnt") or 0),
+                    click_cnt=int(r.get("itemEntranceClkCnt") or 0),
+                    raw=dict(r),
+                ))
+            raw_seen += len(chunk)
+            total = int(data.get("totalCount") or 0)
+            if not chunk:
+                break
+            if total > 0 and raw_seen >= total:
+                break
+            page_no += 1
+        if total > 0 and raw_seen < total:
+            self.log(f"[report] 警告: {account_id} 区间仅取到 {raw_seen}/{total} 行")
+        return rows
+
     def fetch_products(self, page, account_id: str, account_name: str, day: datetime,
                        retries: int = 3) -> list[ProductRow]:
         begin = int(day.timestamp() * 1000)

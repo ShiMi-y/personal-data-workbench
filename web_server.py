@@ -35,8 +35,11 @@ import app_secret
 app_runtime.install()
 
 import export_full  # noqa: E402
+import export_syt  # noqa: E402
 import kx_core as kx  # noqa: E402
 import merge_excel  # noqa: E402
+import merge_roi  # noqa: E402
+import week_data  # noqa: E402
 
 WEB_DIR = kx.BUNDLE_DIR / "web"  # 打包后页面资源在解包目录
 
@@ -52,8 +55,23 @@ def _job_new(kind: str) -> str:
     jid = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
         JOBS[jid] = {"id": jid, "kind": kind, "status": "running", "logs": [],
-                     "progress": None, "result": None, "error": None}
+                     "progress": None, "result": None, "error": None, "cancel": False}
     return jid
+
+
+def _job_cancel(jid: str) -> bool:
+    with JOBS_LOCK:
+        job = JOBS.get(jid)
+        if job is None or job.get("status") != "running":
+            return False
+        job["cancel"] = True
+    return True
+
+
+def _job_cancelled(jid: str) -> bool:
+    with JOBS_LOCK:
+        job = JOBS.get(jid)
+        return bool(job and job.get("cancel"))
 
 
 def _job_log(jid: str, msg: str):
@@ -201,6 +219,7 @@ def _login_accounts_public(cfg: dict) -> list[dict]:
     out = []
     for a in kx.login_accounts(cfg):
         p = str(a.get("excel_path") or "").strip()
+        roi = str(a.get("roi_book_path") or "").strip()
         out.append({
             "id": str(a.get("id")),
             "label": str(a.get("label") or a.get("login_account") or a.get("id")),
@@ -208,6 +227,9 @@ def _login_accounts_public(cfg: dict) -> list[dict]:
             "login_role": str(a.get("login_role") or "auto"),
             "excel_path": p,
             "excel_exists": bool(p) and kx.resolve_path(p).exists(),
+            "roi_book_path": roi,
+            "roi_book_exists": bool(roi) and kx.resolve_path(roi).exists(),
+            "week_cost_source": str(a.get("week_cost_source") or "both"),
             "enabled": a.get("enabled", True) is not False,
             "has_password": bool(a.get("password")),
             "include_accounts": list(a.get("include_accounts") or []),
@@ -708,6 +730,8 @@ def api_save_login_account(body: dict) -> dict:
             "password": "",
             "login_role": "auto",
             "excel_path": "",
+            "roi_book_path": "",
+            "week_cost_source": "both",
             "enabled": True,
             "include_accounts": [],
             "exclude_accounts": [],
@@ -739,6 +763,16 @@ def api_save_login_account(body: dict) -> dict:
         if p and Path(p).suffix.lower() not in EXCEL_SUFFIXES:
             raise ValueError("月度表仅支持 .xlsx / .xlsm 格式")
         cur["excel_path"] = p
+    if "roi_book_path" in body:
+        p = str(body.get("roi_book_path") or "").strip()
+        if p and Path(p).suffix.lower() not in EXCEL_SUFFIXES:
+            raise ValueError("核算表仅支持 .xlsx / .xlsm 格式")
+        cur["roi_book_path"] = p
+    if "week_cost_source" in body:
+        src = str(body.get("week_cost_source") or "both").strip().lower()
+        if src not in ("month", "niu", "both"):
+            raise ValueError("周数据取数维度只能是 month / niu / both")
+        cur["week_cost_source"] = src
     if "enabled" in body:
         cur["enabled"] = bool(body["enabled"])
     if "include_accounts" in body:
@@ -774,6 +808,112 @@ def api_delete_login_account(body: dict) -> dict:
     print(f"[account] 已删除登录账号: id={aid} label={target.get('label')}，"
           f"剩余 {len(cfg['accounts'])} 个（浏览器登录态目录保留）")
     return {"ok": True, "login_accounts": _login_accounts_public(cfg)}
+
+
+def _pick_owner(cfg: dict, owner_id: str | None) -> dict:
+    acct = kx.find_login_account(cfg, owner_id) if owner_id else None
+    if acct is None:
+        acct = _enabled_login_accounts(cfg)[0]
+    return acct
+
+
+def api_syt_export(owner_id: str | None = None, logger=print) -> dict:
+    """下载生意通：上一周 + 近30日"""
+    cfg = _config_snapshot()
+    acct = _pick_owner(cfg, owner_id)
+    ecfg = kx.account_cfg(cfg, acct)
+    logger(f"[syt] 使用账号「{acct.get('label') or acct.get('id')}」")
+    return export_syt.run_export(ecfg, logger=logger)
+
+
+def api_week_cache(body: dict) -> dict:
+    start = str(body.get("start") or "").strip()
+    end = str(body.get("end") or "").strip()
+    rs = str(body.get("range_start") or "").strip()
+    re_ = str(body.get("range_end") or "").strip()
+    if not all((start, end, rs, re_)):
+        raise ValueError("缺少日期参数（start/end/range_start/range_end）")
+    return week_data.check_cache(start, end, rs, re_)
+
+
+def api_roi_check(body: dict) -> dict:
+    from openpyxl import load_workbook
+    start = str(body.get("start") or "").strip()
+    end = str(body.get("end") or "").strip()
+    rs = str(body.get("range_start") or "").strip()
+    re_ = str(body.get("range_end") or "").strip()
+    if not all((start, end, rs, re_)):
+        raise ValueError("缺少日期参数（start/end/range_start/range_end）")
+    cfg = _config_snapshot()
+    acct = _pick_owner(cfg, str(body.get("owner") or "").strip() or None)
+    ecfg = kx.account_cfg(cfg, acct)
+    raw = str(ecfg.get("roi_book_path") or "").strip()
+    if not raw:
+        return {"exists": False, "reason": "未配置核算表"}
+    book = kx.resolve_path(raw)
+    if not book.exists():
+        return {"exists": False, "reason": "核算表不存在"}
+    label7 = merge_roi.date_label(merge_roi._parse(start), merge_roi._parse(end))
+    wb = load_workbook(book)
+    try:
+        blocks = merge_roi.detect_periods(wb[merge_roi.SHEET_PROFIT])
+    finally:
+        wb.close()
+    dup = [b for b in blocks if b["label"] == label7]
+    return {"exists": bool(dup), "label": label7,
+            "first": dup[-1]["first"] if dup else None,
+            "total": dup[-1]["total"] if dup else None}
+
+
+def api_week_collect(body: dict, logger=print) -> dict:
+    """拉取周数据：磁力金牛花费/成交 + 生意通退款率，只生成预览不写表"""
+    start = str(body.get("start") or "").strip()
+    end = str(body.get("end") or "").strip()
+    rs = str(body.get("range_start") or "").strip()
+    re_ = str(body.get("range_end") or "").strip()
+    if not all((start, end, rs, re_)):
+        raise ValueError("缺少日期参数（start/end/range_start/range_end）")
+    cfg = _config_snapshot()
+    acct = _pick_owner(cfg, str(body.get("owner") or "").strip() or None)
+    ecfg = kx.account_cfg(cfg, acct)
+    if not ecfg.get("roi_book_path"):
+        raise ValueError("该账号未配置核算表路径，请到「账号管理」填写")
+    logger(f"[week] 使用账号「{acct.get('label') or acct.get('id')}」")
+    return week_data.collect(ecfg, start, end, rs, re_,
+                             reuse=bool(body.get("reuse", True)), logger=logger)
+
+
+def api_roi_merge(body: dict, logger=print) -> dict:
+    """写退款率 / 盈利两张表"""
+    start = str(body.get("start") or "").strip()
+    end = str(body.get("end") or "").strip()
+    rs = str(body.get("range_start") or "").strip()
+    re_ = str(body.get("range_end") or "").strip()
+    if not all((start, end, rs, re_)):
+        raise ValueError("缺少日期参数（start/end/range_start/range_end）")
+    cfg = _config_snapshot()
+    acct = _pick_owner(cfg, str(body.get("owner") or "").strip() or None)
+    ecfg = kx.account_cfg(cfg, acct)
+    if not ecfg.get("roi_book_path"):
+        raise ValueError("该账号未配置核算表路径，请到「账号管理」填写")
+
+    items = None
+    if body.get("use_preview"):
+        pv = week_data.load_preview(start, end)
+        if not pv:
+            raise ValueError("没有找到该周期的预览数据，请先点「拉取周数据」")
+        if pv.get("range_start") != rs or pv.get("range_end") != re_:
+            raise ValueError("预览数据的 30 日区间与当前选择不一致，请重新拉取")
+        items = pv.get("items")
+        if not items:
+            raise ValueError("预览数据为空，请重新拉取")
+
+    logger(f"[roi] 使用账号「{acct.get('label') or acct.get('id')}」"
+           + ("（使用预览数据）" if items else ""))
+    return merge_roi.run_merge(ecfg, start, end, rs, re_, items=items,
+                               backup=bool(cfg.get("auto_backup", True)),
+                               save=not bool(body.get("dry_run")),
+                               overwrite=bool(body.get("overwrite")), logger=logger)
 
 
 def api_preview(start: str, end: str, only_accounts: list[str] | None = None,
@@ -827,6 +967,21 @@ def api_preview(start: str, end: str, only_accounts: list[str] | None = None,
         cached = _cached_accounts(_config_snapshot())
         want_owners = {str(x) for x in (only_owners or [])}
         want_ids = {str(x) for x in (only_accounts or [])}
+        # 只把本次导出实际请求过的账户补成失败行，未勾选的账户不展示
+        requested: set[tuple] = set()
+        for owner, d in sources:
+            sp = d / "summary.json"
+            if not sp.exists():
+                continue
+            try:
+                sj = json.loads(sp.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            oid = str(owner.get("id")) if owner else ""
+            for item in sj.get("accounts_requested") or []:
+                aid = str(item.get("account_id") or "")
+                if aid:
+                    requested.add((oid, aid))
         for t in cached:
             oid, aid = str(t.get("owner_id") or ""), str(t.get("id"))
             if want_owners and oid not in want_owners:
@@ -834,6 +989,8 @@ def api_preview(start: str, end: str, only_accounts: list[str] | None = None,
             if want_ids and aid not in want_ids:
                 continue
             if (oid, aid) in have:
+                continue
+            if requested and (oid, aid) not in requested:
                 continue
             have.add((oid, aid))
             accs.append({
@@ -1712,6 +1869,11 @@ class Handler(BaseHTTPRequestHandler):
                     if not job:
                         return self._json({"error": "job 不存在"}, 404)
                     return self._json(dict(job))
+
+            if u.path == "/api/job/cancel":
+                jid = q.get("id", "")
+                ok = _job_cancel(jid)
+                return self._json({"ok": ok, "id": jid})
             return self._json({"error": "not found"}, 404)
         except Exception as e:  # noqa: BLE001
             print(f"[web] {self.command} {self.path} 失败: {type(e).__name__}: {e}")
@@ -1736,7 +1898,12 @@ class Handler(BaseHTTPRequestHandler):
 
                 def work():
                     results, failures = [], []
+                    stopped = False
                     for acct in owners:
+                        if _job_cancelled(jid):
+                            stopped = True
+                            _job_log(jid, "[export] 收到停止指令，已中止")
+                            break
                         label = acct.get("label") or acct.get("id")
                         _job_log(jid, f"[export] 账号「{label}」开始…")
                         try:
@@ -1744,13 +1911,16 @@ class Handler(BaseHTTPRequestHandler):
                             outdir = _export_owner_dir(start, end, str(acct.get("id")))
                             s = export_full.run_export(ecfg, start, end, mapping.get(str(acct.get("id"))),
                                                        outdir=outdir,
-                                                       logger=lambda m: _job_log(jid, m))
+                                                       logger=lambda m: _job_log(jid, m),
+                                                       cancel=lambda: _job_cancelled(jid))
                             results.append({"owner_id": str(acct.get("id")), "owner_label": label, "summary": s})
                         except Exception as e:  # noqa: BLE001
                             _job_log(jid, f"[export] 账号「{label}」失败: {type(e).__name__}: {e}")
                             failures.append({"owner_id": str(acct.get("id")), "owner_label": label,
                                              "error": str(e)[:300]})
-                    if not results:
+                    if stopped:
+                        _job_done(jid, {"owners": results, "failures": failures, "cancelled": True})
+                    elif not results:
                         _job_done(jid, error=f"全部账号导出失败（{len(failures)} 个）")
                     else:
                         _job_done(jid, {"owners": results, "failures": failures})
@@ -1946,6 +2116,59 @@ class Handler(BaseHTTPRequestHandler):
                     "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "elapsed": round(time.time() - started_ts, 1),
                 })
+
+            if u.path == "/api/syt/export":
+                body = self._body()
+                owner = str(body.get("owner") or "").strip() or None
+                jid = _job_new("syt")
+
+                def work_syt():
+                    try:
+                        res = api_syt_export(owner, logger=lambda m: _job_log(jid, m))
+                        _job_done(jid, res)
+                    except Exception as e:  # noqa: BLE001
+                        _job_log(jid, f"[syt] 失败: {type(e).__name__}: {e}")
+                        _job_done(jid, error=f"{type(e).__name__}: {e}")
+
+                threading.Thread(target=work_syt, daemon=True).start()
+                return self._json({"job_id": jid})
+
+            if u.path == "/api/week/cache":
+                try:
+                    return self._json(api_week_cache(self._body()))
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+
+            if u.path == "/api/roi/check":
+                try:
+                    return self._json(api_roi_check(self._body()))
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+
+            if u.path == "/api/week/collect":
+                body = self._body()
+                jid = _job_new("week")
+
+                def work_week():
+                    try:
+                        res = api_week_collect(body, logger=lambda m: _job_log(jid, m))
+                        _job_done(jid, res)
+                    except Exception as e:  # noqa: BLE001
+                        _job_log(jid, f"[week] 失败: {type(e).__name__}: {e}")
+                        _job_done(jid, error=f"{type(e).__name__}: {e}")
+
+                threading.Thread(target=work_week, daemon=True).start()
+                return self._json({"job_id": jid})
+
+            if u.path == "/api/roi/merge":
+                try:
+                    return self._json(api_roi_merge(self._body()))
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[roi] 失败: {type(e).__name__}: {e}")
+                    traceback.print_exc()
+                    return self._json({"error": f"{type(e).__name__}: {e}"}, 500)
 
             return self._json({"error": "not found"}, 404)
         except Exception as e:  # noqa: BLE001

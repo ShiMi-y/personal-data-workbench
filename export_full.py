@@ -102,7 +102,8 @@ def _write_xlsx(path: Path, acc_rows: list[list], prod_rows: list[list],
 
 
 def run_export(cfg: dict, start: str, end: str, account_ids: list[str] | None = None,
-               outdir: Path | None = None, logger=print) -> dict:
+               outdir: Path | None = None, logger=print, range_mode: bool = False,
+               cancel=None) -> dict:
     days = kx.day_range(start, end)
     outdir = outdir or (kx.DATA_DIR / "exports" / f"{start}_{end}")
     outdir.mkdir(parents=True, exist_ok=True)
@@ -120,17 +121,28 @@ def run_export(cfg: dict, start: str, end: str, account_ids: list[str] | None = 
                          for a in accounts]
 
         for acc in accounts:
+            if cancel and cancel():
+                raise RuntimeError("任务已被用户停止")
             aid, aname = str(acc["id"]), acc.get("name") or ""
             logger(f"[export] 账户 {aid} {aname}")
             home = None
             try:
                 home = client.open_account(aid)
-                for day in days:
-                    rows = client.fetch_products(home, aid, aname, day)
-                    cost = round(sum(r.cost for r in rows), 2)
-                    gmv = round(sum(r.gmv for r in rows), 2)
+                if range_mode:
+                    rows = client.fetch_products_range(home, aid, aname, days[0], days[-1])
                     prod.extend(rows)
-                    logger(f"    {day:%Y-%m-%d} 商品 {len(rows)} 个 花费 {cost} 成交 {gmv}")
+                    logger(f"    {start}~{end} 商品行 {len(rows)} "
+                           f"花费 {round(sum(r.cost for r in rows), 2)} "
+                           f"成交 {round(sum(r.gmv for r in rows), 2)}")
+                else:
+                    for day in days:
+                        if cancel and cancel():
+                            raise RuntimeError("任务已被用户停止")
+                        rows = client.fetch_products(home, aid, aname, day)
+                        cost = round(sum(r.cost for r in rows), 2)
+                        gmv = round(sum(r.gmv for r in rows), 2)
+                        prod.extend(rows)
+                        logger(f"    {day:%Y-%m-%d} 商品 {len(rows)} 个 花费 {cost} 成交 {gmv}")
             except Exception as e:  # noqa: BLE001
                 logger(f"    失败: {type(e).__name__}: {e}")
                 failures.append({"account_id": aid, "account_name": aname, "error": str(e)[:300]})

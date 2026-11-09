@@ -57,6 +57,17 @@
   #log.show{display:block}
   #log .t{color:#64748b;margin-right:8px}
   #log .err{color:#fca5a5}
+  #wkLog{background:#0b1220;color:#cbd5e1;border-radius:10px;padding:12px 14px;height:180px;overflow:auto;
+         font:12px/1.7 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;display:none}
+  #wkLog.show{display:block}
+  #wkLog .t{color:#64748b;margin-right:8px}
+  #wkLog .err{color:#fca5a5}
+  .weekdates{display:flex;flex-direction:column;gap:10px;max-width:560px}
+  .weekrow{display:flex;align-items:center;gap:10px}
+  .weekrow .wk-label{width:88px;flex:none;font-size:13px;color:var(--muted)}
+  .weekrow input[type=date]{flex:1;min-width:0}
+  .weekrow .wk-sep{color:var(--muted);font-size:13px;flex:none}
+  .diff{color:#dc2626;font-weight:600}
   .stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin-bottom:16px}
   .stat{background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px 16px}
   .stat .k{font-size:12px;color:var(--muted);margin-bottom:6px}
@@ -155,9 +166,10 @@
     <div class="brand">快手数据工作台</div>
     <nav>
       <button class="navitem active" data-panel="realtime">一、实时数据</button>
-      <button class="navitem" data-panel="export">二、导出数据</button>
-      <button class="navitem" data-panel="accounts">三、账号管理</button>
-      <button class="navitem" data-panel="settings">四、设置</button>
+      <button class="navitem" data-panel="export">二、日数据导出</button>
+      <button class="navitem" data-panel="week">三、周数据导出</button>
+      <button class="navitem" data-panel="accounts">四、账号管理</button>
+      <button class="navitem" data-panel="settings">五、设置</button>
     </nav>
     <div class="sidefoot">
       <div class="verline">
@@ -232,6 +244,7 @@
     <div class="accounts" id="accounts"></div>
     <div class="toolbar">
       <button class="primary" id="btnExport">拉取全量数据</button>
+      <button class="ghost" id="btnStop" style="display:none">停止</button>
       <button class="success" id="btnMerge" disabled>合并到 Excel</button>
       <button class="ghost" id="btnToggleLog">显示日志</button>
       <span class="hint" id="scopeHint"></span>
@@ -249,6 +262,53 @@
   <section class="card">
     <h2>合并结果</h2>
     <div id="mergeBody"><div class="empty">合并后在这里查看 9 项自检结果</div></div>
+  </section>
+  </section>
+
+  <section class="panel" id="panel-week">
+  <section class="card">
+    <h2>周数据导出 <span class="badge gray" id="wkPeriod">-</span></h2>
+    <div class="hint">从生意通下载「上一周」和「近30日」商品列表，再把退款率写入核算表的「退款率」「盈利」两张子表。周期标签按日期自动生成。</div>
+    <div class="weekdates">
+      <div class="weekrow">
+        <span class="wk-label">本周周一</span>
+        <input type="date" id="wkMonday" />
+        <span class="wk-sep">重算基准</span>
+      </div>
+      <div class="weekrow">
+        <span class="wk-label">7 日起止</span>
+        <input type="date" id="wkStart" />
+        <span class="wk-sep">至</span>
+        <input type="date" id="wkEnd" />
+      </div>
+      <div class="weekrow">
+        <span class="wk-label">30 日起止</span>
+        <input type="date" id="wkRangeStart" />
+        <span class="wk-sep">至</span>
+        <input type="date" id="wkRangeEnd" />
+      </div>
+      <div class="weekrow">
+        <span class="wk-label"></span>
+        <button class="ghost" id="btnWkReset">按今天重算</button>
+      </div>
+    </div>
+    <div class="toolbar">
+      <button class="primary" id="btnSyt">拉取周数据</button>
+      <button class="success" id="btnRoi" disabled>写入核算表</button>
+      <button class="ghost" id="btnWkToggleLog">显示日志</button>
+      <span class="hint" id="wkHint"></span>
+    </div>
+    <div id="wkLog"></div>
+  </section>
+
+  <section class="card">
+    <h2>数据预览</h2>
+    <div id="wkPreview"><div class="empty">点「拉取周数据」后在这里预览，确认无误再写入核算表</div></div>
+  </section>
+
+  <section class="card">
+    <h2>写表结果</h2>
+    <div id="wkResult"><div class="empty">写表后在这里查看校验清单</div></div>
   </section>
   </section>
 
@@ -292,6 +352,21 @@
           <input type="text" id="accExcel" placeholder="D:\path\to\月度表.xlsx" style="flex:1" />
           <button class="ghost" id="btnPickAccExcel">选择文件…</button>
         </div>
+      </div>
+      <div class="field wide">
+        <label>核算表路径（退款率 / 盈利，仅 .xlsx / .xlsm）</label>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="accRoiBook" placeholder="D:\path\to\快手退款率ROI利润核算.xlsx" style="flex:1" />
+          <button class="ghost" id="btnPickAccRoi">选择文件…</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>周数据金牛取数维度</label>
+        <select id="accWeekSource">
+          <option value="both">双渠道检验（月度表 + 金牛）</option>
+          <option value="month">月度表</option>
+          <option value="niu">磁力金牛</option>
+        </select>
       </div>
       <div class="field">
         <label>启用</label>
@@ -952,16 +1027,23 @@ function renderAccountList() {
     const excelBadge = !a.excel_path
       ? '<span class="badge err">未配置月度表</span>'
       : (a.excel_exists ? '<span class="badge ok">Excel 已就绪</span>' : '<span class="badge err">Excel 未找到</span>');
+    const roi = a.roi_book_path
+      ? `<div class="path">核算表：${escapeHtml(a.roi_book_path)}</div>`
+      : '<div class="hint" style="margin-top:6px">未配置核算表路径</div>';
+    const roiBadge = !a.roi_book_path
+      ? '<span class="badge gray">无核算表</span>'
+      : (a.roi_book_exists ? '<span class="badge ok">核算表已就绪</span>' : '<span class="badge err">核算表未找到</span>');
     const disabled = a.enabled ? '' : '<span class="badge gray">已停用</span>';
     const alertN = Object.keys(a.alert_thresholds || {}).length;
     return `<div class="accitem">
       <div class="top">
         <b>${escapeHtml(a.label)}</b>
         <span class="muted">${phone}</span>
-        ${excelBadge} ${disabled}
+        ${excelBadge} ${roiBadge} ${disabled}
         <span class="badge gray">${alertN ? '预警 ' + alertN + ' 个' : '无预警线'}</span>
       </div>
       ${excel}
+      ${roi}
       <div class="acts">
         <button class="ghost" data-edit="${a.id}">编辑</button>
         <button class="ghost" data-del="${a.id}">删除</button>
@@ -983,6 +1065,8 @@ function openAccountForm(id) {
   $('#accPassword').placeholder = a && a.has_password ? '已设置，留空表示不修改' : '留空则仅用登录态';
   $('#accRole').value = a ? a.login_role : 'auto';
   $('#accExcel').value = a ? a.excel_path : '';
+  $('#accRoiBook').value = a ? (a.roi_book_path || '') : '';
+  $('#accWeekSource').value = a ? (a.week_cost_source || 'both') : 'both';
   $('#accEnabled').checked = a ? a.enabled : true;
   $('#accInclude').value = a ? (a.include_accounts || []).join(',') : '';
   $('#accExclude').value = a ? (a.exclude_accounts || []).join(',') : '';
@@ -996,11 +1080,18 @@ async function saveAccount() {
     $('#accFormHint').textContent = '月度表仅支持 .xlsx / .xlsm';
     return;
   }
+  const roiBook = $('#accRoiBook').value.trim();
+  if (roiBook && !/\.(xlsx|xlsm)$/i.test(roiBook)) {
+    $('#accFormHint').textContent = '核算表仅支持 .xlsx / .xlsm';
+    return;
+  }
   const body = {
     label: $('#accLabel').value.trim(),
     login_account: $('#accLogin').value.trim(),
     login_role: $('#accRole').value,
     excel_path: excel,
+    roi_book_path: roiBook,
+    week_cost_source: $('#accWeekSource').value,
     enabled: $('#accEnabled').checked,
     include_accounts: $('#accInclude').value,
     exclude_accounts: $('#accExclude').value,
@@ -1236,10 +1327,11 @@ function renderRealtime(d) {
     }
   }
   const overIds = new Set(alerts.map((x) => `${x.owner_id || ''}|${x.account_id}`));
+  const rtMultiOwner = new Set(accs.map((a) => a.owner_label || '')).size > 1;
   const rows = accs.map((a) => {
     const name = a.account_name || a.account_id || '';
     return `<tr${overIds.has(`${a.owner_id || ''}|${a.account_id}`) ? ' class="over"' : ''}>
-      <td>${escapeHtml(a.owner_label || '-')}</td>
+      ${rtMultiOwner ? `<td>${escapeHtml(a.owner_label || '-')}</td>` : ''}
       <td>${escapeHtml(name)}<span class="muted"> ${escapeHtml(String(a.account_id))}</span></td>
       <td class="num">${fmt(a.cost)}</td><td class="num">${fmt(a.gmv)}</td>
       <td class="num">${fmt(a.roi)}</td><td class="num">${a.order_cnt}</td>
@@ -1251,7 +1343,7 @@ function renderRealtime(d) {
     ? `<div class="hint" style="color:var(--err)">失败：${failures.map((f) => escapeHtml([f.owner_label, f.account_id, f.account_name].filter(Boolean).join(' ') + (f.error ? '（' + f.error.slice(0, 60) + '）' : ''))).join('、')}</div>`
     : '';
   body.innerHTML = (rows ? `<div class="tablebox"><table>
-      <thead><tr><th>账号</th><th>账户</th><th>消耗</th><th>成交</th><th>ROI</th><th>成交订单</th><th>商品数</th><th>预警线</th></tr></thead>
+      <thead><tr>${rtMultiOwner ? '<th>账号</th>' : ''}<th>账户</th><th>消耗</th><th>成交</th><th>ROI</th><th>成交订单</th><th>商品数</th><th>预警线</th></tr></thead>
       <tbody>${rows}</tbody></table></div>` : '<div class="empty">当日暂无消耗数据</div>') + fail;
   body.querySelectorAll('.alertinput').forEach((inp) => {
     inp.addEventListener('input', () => {
@@ -1401,35 +1493,44 @@ function renderPreview(p) {
     <div class="stat"><div class="k">消耗合计</div><div class="v">${fmt(t.cost)}<small>元</small></div></div>
     <div class="stat"><div class="k">成交合计</div><div class="v">${fmt(t.gmv)}<small>元</small></div></div>
     <div class="stat"><div class="k">整体 ROI</div><div class="v">${fmt(t.roi)}</div></div>
-    <div class="stat"><div class="k">账户 / 商品行</div><div class="v">${t.account_rows}<small>/ ${t.product_rows} 行</small></div></div>`;
+    <div class="stat"><div class="k">账户 / 商品行</div><div class="v">${p.accounts.filter((a) => !a.failed).length}<small>/ ${t.product_rows} 行</small></div></div>`;
 
-  const rows = p.accounts.map((a) => {
+  const okAccounts = p.accounts.filter((a) => !a.failed);
+  const failedN = p.accounts.length - okAccounts.length;
+  if (!okAccounts.length) {
+    stats.innerHTML = '';
+    body.innerHTML = '<div class="empty">该日期范围还没有导出数据，点击「拉取全量数据」</div>';
+    links.innerHTML = '';
+    return;
+  }
+  const ownerSet = new Set(okAccounts.map((a) => a.owner_label || ''));
+  const multiOwner = ownerSet.size > 1;
+  const rows = okAccounts.map((a) => {
     const roi = Number(a.cost) ? (Number(a.gmv) / Number(a.cost)) : 0;
-    const fail = a.failed ? ` <span class="badge err" title="${escapeHtml(a.error || '拉取失败')}">拉取失败</span>` : '';
     return `<tr>
       <td>${a.date}</td>
-      <td>${escapeHtml(a.owner_label || '-')}</td>
-      <td>${accountLabel(a)}${fail}</td>
+      ${multiOwner ? `<td>${escapeHtml(a.owner_label || '-')}</td>` : ''}
+      <td>${accountLabel(a)}</td>
       <td class="num">${fmt(a.cost)}</td><td class="num">${fmt(a.gmv)}</td><td class="num">${fmt(roi)}</td>
       <td class="num">${a.order_cnt}</td><td class="num">${a.product_count}</td></tr>`;
   }).join('');
 
   const prows = p.products.slice(0, 300).map((x) => `<tr>
-      <td>${x.date}</td><td>${escapeHtml(x.owner_label || '-')}</td><td>${accountLabel(x)}</td>
+      <td>${x.date}</td>${multiOwner ? `<td>${escapeHtml(x.owner_label || '-')}</td>` : ''}<td>${accountLabel(x)}</td>
       <td style="text-align:left">${productLabel((x.product_name || '').slice(0, 40), x.product_id)}</td>
       <td class="num">${fmt(x.cost)}</td><td class="num">${fmt(x.gmv)}</td><td class="num">${x.order_cnt}</td>
       <td class="num">${fmt(x.roi)}</td></tr>`).join('');
 
   body.innerHTML = `
     <div class="tablebox"><table>
-      <thead><tr><th>日期</th><th>账号</th><th>账户</th><th>消耗</th><th>成交</th><th>ROI</th><th>成交订单</th><th>商品数</th></tr></thead>
+      <thead><tr><th>日期</th>${multiOwner ? '<th>账号</th>' : ''}<th>账户</th><th>消耗</th><th>成交</th><th>ROI</th><th>成交订单</th><th>商品数</th></tr></thead>
       <tbody>${rows}</tbody></table></div>
     <details>
       <summary>展开商品明细（共 ${p.products.length} 行，最多展示 300 行）</summary>
       <div class="tablebox"><table>
-        <thead><tr><th>日期</th><th>账号</th><th>账户</th><th style="text-align:left">商品</th><th>消耗</th><th>成交</th><th>成交订单</th><th>ROI</th></tr></thead>
+        <thead><tr><th>日期</th>${multiOwner ? '<th>账号</th>' : ''}<th>账户</th><th style="text-align:left">商品</th><th>消耗</th><th>成交</th><th>成交订单</th><th>ROI</th></tr></thead>
         <tbody>${prows}</tbody></table></div>
-    </details>`;
+    </details>` + (failedN ? `<div class="hint">另有 ${failedN} 个账户上次导出无数据，未计入上表</div>` : '');
   const files = p.owner_files && p.owner_files.length ? p.owner_files : [{
     owner_label: '', accounts_csv: p.files.accounts_csv,
     products_csv: p.files.products_csv, xlsx: p.files.xlsx,
@@ -1465,12 +1566,15 @@ async function runExport() {
       body: JSON.stringify({ start, end, owners: Object.keys(byOwner), accounts_by_owner: byOwner }),
     });
     let seen = 0;
+    state.currentJob = job_id;
+    updateStopBtn();
     for (;;) {
       await new Promise((r) => setTimeout(r, 1200));
       const job = await api('/api/job?id=' + job_id);
       for (; seen < job.logs.length; seen++) logLine(job.logs[seen]);
       if (job.status === 'done' || job.status === 'error') {
         if (job.status === 'error') logLine('失败：' + job.error, true);
+        else if (job.result && job.result.cancelled) logLine('任务已停止', true);
         else logLine('拉取完成');
         break;
       }
@@ -1479,7 +1583,25 @@ async function runExport() {
   } catch (e) {
     logLine('异常：' + e.message, true);
   } finally {
+    state.currentJob = null;
+    updateStopBtn();
     btn.disabled = false;
+  }
+}
+
+function updateStopBtn() {
+  const b = $('#btnStop');
+  if (b) b.style.display = state.currentJob ? '' : 'none';
+}
+
+async function stopCurrentJob() {
+  if (!state.currentJob) return;
+  if (!confirm('确定停止当前任务？已拉取的部分数据会保留。')) return;
+  try {
+    await api('/api/job/cancel?id=' + encodeURIComponent(state.currentJob));
+    logLine('已发送停止指令，等待当前账户结束后中止…');
+  } catch (e) {
+    alert('停止失败：' + e.message);
   }
 }
 
@@ -1567,6 +1689,7 @@ $('#btnNone').addEventListener('click', () => {
   state.selected.clear(); updateScope(); refreshPreview();
 });
 $('#btnExport').addEventListener('click', runExport);
+$('#btnStop').addEventListener('click', stopCurrentJob);
 $('#btnRealtime').addEventListener('click', refreshRealtime);
 $('#rtAutoChk').addEventListener('change', async (e) => {
   const on = e.target.checked;
@@ -1612,6 +1735,299 @@ $('#btnPickAccExcel').addEventListener('click', async (e) => {
     $('#accFormHint').textContent = '选择失败：' + err.message;
   }
 });
+
+$('#btnPickAccRoi').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  $('#accFormHint').textContent = '已打开文件选择框（若没看到，请查看任务栏）';
+  try {
+    const path = await pickExcelFile($('#accRoiBook').value, $('#accRoiBook'), btn);
+    $('#accFormHint').textContent = path ? '已选择：' + path : '已取消选择';
+  } catch (err) {
+    $('#accFormHint').textContent = '选择失败：' + err.message;
+  }
+});
+
+// ---------------- 周数据导出 ----------------
+function isoLocal(d) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function weekDates() {
+  const now = new Date();
+  const dow = now.getDay() || 7;
+  const mondayThis = new Date(now);
+  mondayThis.setDate(now.getDate() - (dow - 1));
+  const start = new Date(mondayThis);
+  start.setDate(mondayThis.getDate() - 7);
+  const end = new Date(start);
+  end.setDate(start.getDate() + 6);
+  const rs = new Date(end);
+  rs.setDate(end.getDate() - 29);
+  return { start, end, rs, re: end };
+}
+
+function shortLabel(iso) {
+  const p = String(iso || '').split('-');
+  return p.length === 3 ? `${Number(p[1])}.${Number(p[2])}` : '';
+}
+
+function updateWeekPeriod() {
+  const s = $('#wkStart').value, e = $('#wkEnd').value;
+  const rs = $('#wkRangeStart').value, re = $('#wkRangeEnd').value;
+  $('#wkPeriod').textContent = (s && e && rs && re)
+    ? `7日 ${shortLabel(s)}-${shortLabel(e)} · 30日 ${shortLabel(rs)}-${shortLabel(re)}`
+    : '-';
+}
+
+function mondayOf(d) {
+  const x = new Date(d);
+  const dow = x.getDay() || 7;
+  x.setDate(x.getDate() - (dow - 1));
+  return x;
+}
+
+function applyMonday() {
+  const v = $('#wkMonday').value;
+  if (!v) return;
+  const m = new Date(v + 'T00:00:00');
+  const start = new Date(m);
+  start.setDate(m.getDate() - 7);
+  const end = new Date(m);
+  end.setDate(m.getDate() - 1);
+  const rs = new Date(end);
+  rs.setDate(end.getDate() - 29);
+  $('#wkStart').value = isoLocal(start);
+  $('#wkEnd').value = isoLocal(end);
+  $('#wkRangeStart').value = isoLocal(rs);
+  $('#wkRangeEnd').value = isoLocal(end);
+  updateWeekPeriod();
+}
+
+function initWeekDates() {
+  $('#wkMonday').value = isoLocal(mondayOf(new Date()));
+  applyMonday();
+}
+
+function wkLog(msg, isErr) {
+  const el = $('#wkLog');
+  const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  const div = document.createElement('div');
+  if (isErr) div.className = 'err';
+  div.innerHTML = `<span class="t">${t}</span>${escapeHtml(msg)}`;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+}
+
+async function pollJob(jid, onLog) {
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 1500));
+    const job = await api('/api/job?id=' + jid);
+    const logs = job.logs || [];
+    while (onLog.shown < logs.length) {
+      onLog(logs[onLog.shown]);
+      onLog.shown += 1;
+    }
+    if (job.status === 'done') return job.result;
+    if (job.status === 'error') throw new Error(job.error || '任务失败');
+  }
+}
+
+function diffClass(a, b) {
+  if (a === null || a === undefined || b === null || b === undefined) return '';
+  return Math.abs(Number(a) - Number(b)) > 0.01 ? 'diff' : '';
+}
+
+function renderWeekPreview(res) {
+  const items = res.items || [];
+  if (!items.length) {
+    $('#wkPreview').innerHTML = '<div class="empty">没有取到数据</div>';
+    return;
+  }
+  const src = res.cost_source || 'both';
+  const pct = (v) => (v === null || v === undefined) ? '-' : (Number(v) * 100).toFixed(2) + '%';
+  const missTip = (arr) => (arr && arr.length) ? `数据不全，缺 ${arr.length} 天：${arr.join('、')}` : '';
+  const cellMonth = (val, miss) => {
+    const bad = miss && miss.length;
+    return `<td class="${bad ? 'diff' : ''}" title="${escapeHtml(missTip(miss))}">${fmt(val)}${bad ? ' ⚠' : ''}</td>`;
+  };
+  const t = res.totals || {};
+  let head = '';
+  let rows = '';
+  let totalRow = '';
+  if (src === 'month') {
+    head = '<th>商品</th><th>7日花费（月度表）</th><th>7日成交</th><th>7日退款率</th>'
+      + '<th>30日花费（月度表）</th><th>30日成交</th><th>30日退款率</th>';
+    rows = items.map((it) => `<tr>
+      <td>${escapeHtml(it.product_name)}</td>
+      ${cellMonth(it.cost7_month, it.missing7)}
+      <td>${fmt(it.gmv7)}</td><td>${pct(it.rate7)}</td>
+      ${cellMonth(it.cost30_month, it.missing30)}
+      <td>${fmt(it.gmv30)}</td><td>${pct(it.rate30)}</td></tr>`).join('');
+    totalRow = `<tr><td><b>总计</b></td><td><b>${fmt(t.cost7)}</b></td><td><b>${fmt(t.gmv7)}</b></td><td>-</td>`
+      + `<td><b>${fmt(t.cost30)}</b></td><td><b>${fmt(t.gmv30)}</b></td><td>-</td></tr>`;
+  } else if (src === 'niu') {
+    head = '<th>商品</th><th>7日花费（金牛）</th><th>7日成交</th><th>7日退款率</th>'
+      + '<th>30日花费（金牛）</th><th>30日成交</th><th>30日退款率</th>';
+    rows = items.map((it) => `<tr>
+      <td>${escapeHtml(it.product_name)}</td>
+      <td>${fmt(it.cost7_niu)}</td><td>${fmt(it.gmv7)}</td><td>${pct(it.rate7)}</td>
+      <td>${fmt(it.cost30_niu)}</td><td>${fmt(it.gmv30)}</td><td>${pct(it.rate30)}</td></tr>`).join('');
+    totalRow = `<tr><td><b>总计</b></td><td><b>${fmt(t.cost7)}</b></td><td><b>${fmt(t.gmv7)}</b></td><td>-</td>`
+      + `<td><b>${fmt(t.cost30)}</b></td><td><b>${fmt(t.gmv30)}</b></td><td>-</td></tr>`;
+  } else {
+    head = '<th>商品</th><th>7日（月度表）</th><th>7日（金牛）</th><th>7日成交</th><th>7日退款率</th>'
+      + '<th>30日（月度表）</th><th>30日（金牛）</th><th>30日成交</th><th>30日退款率</th>';
+    rows = items.map((it) => {
+      const d7 = diffClass(it.cost7_month, it.cost7_niu);
+      const d30 = diffClass(it.cost30_month, it.cost30_niu);
+      return `<tr>
+        <td>${escapeHtml(it.product_name)}</td>
+        <td class="${d7 || (it.incomplete7 ? 'diff' : '')}" title="${escapeHtml(missTip(it.missing7))}">${fmt(it.cost7_month)}${it.incomplete7 ? ' ⚠' : ''}</td>
+        <td class="${d7}">${fmt(it.cost7_niu)}</td>
+        <td>${fmt(it.gmv7)}</td><td>${pct(it.rate7)}</td>
+        <td class="${d30 || (it.incomplete30 ? 'diff' : '')}" title="${escapeHtml(missTip(it.missing30))}">${fmt(it.cost30_month)}${it.incomplete30 ? ' ⚠' : ''}</td>
+        <td class="${d30}">${fmt(it.cost30_niu)}</td>
+        <td>${fmt(it.gmv30)}</td><td>${pct(it.rate30)}</td></tr>`;
+    }).join('');
+    const sum = (key) => items.reduce((s, it) => s + (it[key] === null || it[key] === undefined ? 0 : Number(it[key])), 0);
+    totalRow = `<tr><td><b>总计</b></td>
+      <td><b>${fmt(sum('cost7_month'))}</b></td><td><b>${fmt(t.cost7)}</b></td>
+      <td><b>${fmt(t.gmv7)}</b></td><td>-</td>
+      <td><b>${fmt(sum('cost30_month'))}</b></td><td><b>${fmt(t.cost30)}</b></td>
+      <td><b>${fmt(t.gmv30)}</b></td><td>-</td></tr>`;
+  }
+  const srcName = { month: '月度表', niu: '磁力金牛', both: '双渠道检验' }[src] || src;
+  $('#wkPreview').innerHTML = `<div class="tablebox"><table>
+    <thead><tr>${head}</tr></thead>
+    <tbody>${rows}${totalRow}</tbody>
+    </table></div>
+    <div class="hint">取数维度：${srcName}；红色 = 差异超过 0.01 或月度表数据不全（⚠ 悬停看缺失日期）；周期：${escapeHtml(res.label7 || '')} / ${escapeHtml(res.label30 || '')}；采集时间 ${escapeHtml(res.collected_at || '')}</div>`;
+}
+
+async function runSyt() {
+  const body = {
+    owner: [...state.owners][0] || null,
+    start: $('#wkStart').value,
+    end: $('#wkEnd').value,
+    range_start: $('#wkRangeStart').value,
+    range_end: $('#wkRangeEnd').value,
+  };
+  let reuse = false;
+  try {
+    const c = await api('/api/week/cache', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (c.any) {
+      const lines = [];
+      if (c.week_csv && c.week_csv.exists) lines.push(`· 磁力金牛 7 日数据：${c.week_csv.mtime}`);
+      if (c.prev_csv && c.prev_csv.exists) lines.push(`· 磁力金牛 30 日历史数据：${c.prev_csv.mtime}`);
+      if (c.syt_week && c.syt_week.exists) lines.push(`· 生意通周文件：${c.syt_week.mtime}`);
+      if (c.syt_range && c.syt_range.exists) lines.push(`· 生意通30日文件：${c.syt_range.mtime}`);
+      reuse = window.confirm(
+        `以下数据已存在：\n\n${lines.join('\n')}\n\n` +
+        `点「确定」= 复用已有数据\n点「取消」= 重新导出全部数据（耗时长）`);
+    }
+  } catch (e) { /* 查缓存失败不阻断，按重新导出处理 */ }
+
+  const btn = $('#btnSyt');
+  btn.disabled = true;
+  $('#wkLog').innerHTML = '';
+  $('#wkLog').classList.add('show');
+  $('#wkPreview').innerHTML = `<div class="empty">拉取中…${reuse ? '复用已有数据' : '重新导出全部数据'}，首次约 20 分钟，只补 7 天约 6 分钟</div>`;
+  $('#wkHint').textContent = '正在拉取…';
+  $('#btnRoi').disabled = true;
+  body.reuse = reuse;
+  try {
+    const { job_id } = await api('/api/week/collect', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const onLog = (m) => wkLog(m);
+    onLog.shown = 0;
+    const res = await pollJob(job_id, onLog);
+    renderWeekPreview(res);
+    $('#wkHint').textContent = '预览已生成，确认后写入';
+    $('#btnRoi').disabled = false;
+  } catch (e) {
+    wkLog('失败：' + e.message, true);
+    $('#wkPreview').innerHTML = `<div class="empty">拉取失败：${escapeHtml(e.message)}</div>`;
+    $('#wkHint').textContent = '拉取失败';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderRoiResult(res) {
+  const checks = (res.checks || []).map((c) => `<li class="${c.ok ? '' : 'err'}">${c.ok ? 'PASS' : 'FAIL'} ${escapeHtml(c.name)}${c.detail ? '：' + escapeHtml(c.detail) : ''}</li>`).join('');
+  $('#wkResult').innerHTML = `<div class="accresult">
+    <div class="top">
+      <b>${escapeHtml(res.label7 || '')}</b>
+      <span class="badge ${res.saved ? 'ok' : 'err'}">${res.saved ? '已保存' : '未保存'}</span>
+    </div>
+    <div class="hint">新周期 ${res.new_first}-${res.new_total} 行 · 商品 ${res.items} 个</div>
+    <div class="hint">7日 花费 ${fmt(res.total_cost7)} / 成交 ${fmt(res.total_gmv7)}</div>
+    <div class="hint">30日 花费 ${fmt(res.total_cost30)} / 成交 ${fmt(res.total_gmv30)}</div>
+    <div class="path">${escapeHtml(res.book || '')}</div>
+    <ul class="checks">${checks}</ul>
+  </div>`;
+}
+
+async function runRoi() {
+  const body = {
+    owner: [...state.owners][0] || null,
+    start: $('#wkStart').value,
+    end: $('#wkEnd').value,
+    range_start: $('#wkRangeStart').value,
+    range_end: $('#wkRangeEnd').value,
+    use_preview: true,
+  };
+  try {
+    const chk = await api('/api/roi/check', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (chk.exists) {
+      const ok = window.confirm(
+        `核算表已存在周期「${chk.label}」（第 ${chk.first}-${chk.total} 行）。\n\n` +
+        `点「确定」= 覆盖该周期\n点「取消」= 取消写入`);
+      if (!ok) { $('#wkHint').textContent = '已取消'; return; }
+      body.overwrite = true;
+    }
+  } catch (e) { /* 检查失败继续，后端会兜底拒绝 */ }
+
+  const btn = $('#btnRoi');
+  btn.disabled = true;
+  $('#wkResult').innerHTML = '<div class="empty">写入中…</div>';
+  $('#wkHint').textContent = '正在写表…';
+  try {
+    const res = await api('/api/roi/merge', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    renderRoiResult(res);
+    $('#wkHint').textContent = res.saved ? '已保存' : '未保存';
+  } catch (e) {
+    $('#wkResult').innerHTML = `<div class="empty">写入失败：${escapeHtml(e.message)}</div>`;
+    $('#wkHint').textContent = '写入失败';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$('#btnWkReset').addEventListener('click', initWeekDates);
+$('#btnSyt').addEventListener('click', runSyt);
+$('#btnRoi').addEventListener('click', runRoi);
+$('#btnWkToggleLog').addEventListener('click', () => {
+  const on = $('#wkLog').classList.toggle('show');
+  $('#btnWkToggleLog').textContent = on ? '隐藏日志' : '显示日志';
+});
+$('#wkMonday').addEventListener('change', applyMonday);
+['wkStart', 'wkEnd', 'wkRangeStart', 'wkRangeEnd'].forEach((id) => {
+  $('#' + id).addEventListener('change', updateWeekPeriod);
+});
+initWeekDates();
 
 loadConfig();
 loadState().catch((e) => {
