@@ -77,6 +77,9 @@
   th,td{padding:9px 10px;text-align:right;border-bottom:1px solid #f1f2f4;white-space:nowrap}
   th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}
   thead th{background:#fafbfc;color:var(--muted);font-weight:500;font-size:12px;position:sticky;top:0}
+  thead th.sortable{cursor:pointer;user-select:none}
+  thead th.sortable:hover{color:var(--brand)}
+  thead th.sortable.active{color:var(--brand)}
   tbody tr:hover{background:#fafcff}
   .num{font-variant-numeric:tabular-nums}
   .tablebox{max-height:420px;overflow:auto;border:1px solid var(--line);border-radius:10px}
@@ -520,7 +523,7 @@
 const $ = (s) => document.querySelector(s);
 const state = { accounts: [], selected: new Set(), defaultDate: '', preview: null, realtime: null,
                 cfg: null, rtBusy: false, update: null, loginAccounts: [], owners: new Set(),
-                editingAccount: null };
+                editingAccount: null, rtSort: { key: '', dir: -1 } };
 
 function fmt(n, d = 2) {
   if (n === null || n === undefined || n === '') return '-';
@@ -1389,7 +1392,27 @@ function renderRealtime(d) {
   }
   const overIds = new Set(alerts.map((x) => `${x.owner_id || ''}|${x.account_id}`));
   const rtMultiOwner = new Set(accsAll.map((a) => a.owner_label || '')).size > 1;
-  const rows = accsAll.map((a) => {
+  const sortKey = state.rtSort?.key || '';
+  const sortDir = state.rtSort?.dir || -1;
+  const sortVal = (a, k) => {
+    if (a.failed) return null;  // 拉取失败的行始终排最后
+    const v = Number(a[k]);
+    return Number.isFinite(v) ? v : 0;
+  };
+  let accsSorted = accsAll;
+  if (sortKey) {
+    accsSorted = accsAll.slice().sort((x, y) => {
+      const vx = sortVal(x, sortKey);
+      const vy = sortVal(y, sortKey);
+      if (vx === null && vy === null) return 0;
+      if (vx === null) return 1;
+      if (vy === null) return -1;
+      return vx === vy ? 0 : (vx - vy) * sortDir;
+    });
+  }
+  const arrow = (k) => (sortKey === k ? (sortDir === 1 ? ' ▲' : ' ▼') : '');
+  const sortCls = (k) => `sortable${sortKey === k ? ' active' : ''}`;
+  const rows = accsSorted.map((a) => {
     const name = a.account_name || a.account_id || '';
     const tag = a.failed
       ? ' <span class="badge err" title="今日实时数据拉取失败，数值未知">拉取失败</span>'
@@ -1409,8 +1432,22 @@ function renderRealtime(d) {
     ? `<div class="hint" style="color:var(--err)">失败：${failures.map((f) => escapeHtml([f.owner_label, f.account_id, f.account_name].filter(Boolean).join(' ') + (f.error ? '（' + f.error.slice(0, 60) + '）' : ''))).join('、')}</div>`
     : '';
   body.innerHTML = (rows ? `<div class="tablebox"><table>
-      <thead><tr>${rtMultiOwner ? '<th>账号</th>' : ''}<th>账户</th><th>消耗</th><th>成交</th><th>ROI</th><th>成交订单</th><th>商品数</th><th>预警线</th></tr></thead>
+      <thead><tr>${rtMultiOwner ? '<th>账号</th>' : ''}<th>账户</th>
+      <th class="${sortCls('cost')}" data-sort="cost" title="点击排序">消耗${arrow('cost')}</th>
+      <th class="${sortCls('gmv')}" data-sort="gmv" title="点击排序">成交${arrow('gmv')}</th>
+      <th class="${sortCls('roi')}" data-sort="roi" title="点击排序">ROI${arrow('roi')}</th>
+      <th class="${sortCls('order_cnt')}" data-sort="order_cnt" title="点击排序">成交订单${arrow('order_cnt')}</th>
+      <th class="${sortCls('product_count')}" data-sort="product_count" title="点击排序">商品数${arrow('product_count')}</th>
+      <th>预警线</th></tr></thead>
       <tbody>${rows}</tbody></table></div>` : '<div class="empty">当日暂无消耗数据</div>') + fail;
+  body.querySelectorAll('th[data-sort]').forEach((th) => {
+    th.addEventListener('click', () => {
+      const k = th.dataset.sort;
+      const cur = state.rtSort || { key: '', dir: -1 };
+      state.rtSort = { key: k, dir: cur.key === k ? -cur.dir : -1 };
+      renderRealtime(state.realtime);
+    });
+  });
   body.querySelectorAll('.alertinput').forEach((inp) => {
     inp.addEventListener('input', () => {
       clearTimeout(alertSaveTimer);

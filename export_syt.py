@@ -107,6 +107,73 @@ def pick_preset(page: Page, label: str, logger=print) -> None:
     logger(f"[syt] 已选预设 {label}")
 
 
+CN_MONTH_RE = re.compile(r"(\d{4})年(\d{1,2})月")
+
+
+def _panel_months(page: Page) -> list[tuple[int, int]]:
+    """当前展开的日期面板显示的月份（左、右两个面板）"""
+    txt = page.evaluate("""() => Array.from(document.querySelectorAll(
+        '.ant-picker-dropdown:not(.ant-picker-dropdown-hidden) .ant-picker-panel .ant-picker-header-view'))
+        .map(e => (e.innerText || '').replace(/\\s+/g, ''))""")
+    out = []
+    for t in txt or []:
+        m = CN_MONTH_RE.search(str(t))
+        if m:
+            out.append((int(m.group(1)), int(m.group(2))))
+    return out
+
+
+def _ensure_month(page: Page, target: tuple[int, int]) -> bool:
+    """把日历翻到包含目标月份的位置"""
+    for _ in range(36):
+        months = _panel_months(page)
+        if not months:
+            return False
+        if target in months:
+            return True
+        btn = "prev" if target < months[0] else "next"
+        page.evaluate(
+            """(dir) => { const b = document.querySelector(
+                '.ant-picker-dropdown:not(.ant-picker-dropdown-hidden) .ant-picker-panel '
+                + '.ant-picker-header-' + dir + '-btn'); if (b) b.click(); }""", btn)
+        page.wait_for_timeout(350)
+    return False
+
+
+def pick_range(page: Page, start: date, end: date, logger=print) -> None:
+    """在「自定义」里点选区间，使平台按 UI 填写的日期导出"""
+    s_iso, e_iso = start.isoformat(), end.isoformat()
+    for attempt in range(1, 4):
+        try:
+            page.get_by_text("自定义", exact=True).first.click(timeout=8000)
+        except Exception:  # noqa: BLE001
+            page.evaluate("""() => { const el = Array.from(document.querySelectorAll('*'))
+                .find(e => e.children.length === 0 && (e.innerText || '').trim() === '自定义');
+                if (el) el.click(); }""")
+        page.wait_for_timeout(2200)
+        close_guide(page, logger)
+
+        ok = False
+        if _ensure_month(page, (start.year, start.month)) and click_cell(page, s_iso):
+            page.wait_for_timeout(900)
+            if _ensure_month(page, (end.year, end.month)) and click_cell(page, e_iso):
+                page.wait_for_timeout(1600)
+                # 选完后下拉会关闭、输入框被移除，改为读页面顶部筛选栏文本
+                text = page.evaluate("() => (document.body.innerText || '').slice(0, 3000)")
+                if s_iso in text and e_iso in text:
+                    logger(f"[syt] 已选自定义区间 {s_iso}~{e_iso}")
+                    ok = True
+        if ok:
+            return
+        logger(f"[syt] 第 {attempt} 次自定义区间未生效，重试")
+        try:
+            page.keyboard.press("Escape")
+        except Exception:  # noqa: BLE001
+            pass
+        page.wait_for_timeout(1200)
+    raise RuntimeError(f"日期选择器里选不到 {s_iso}~{e_iso}")
+
+
 def click_export(page: Page, logger=print) -> None:
     page.get_by_text("下载数据", exact=True).first.click(timeout=10000)
     page.wait_for_timeout(3000)
@@ -193,7 +260,7 @@ def verify(path: Path) -> dict:
     return info
 
 
-def run_one(ctx, dc: Page, mode: str, start: date, out_dir: Path,
+def run_one(ctx, dc: Page, mode: str, start: date, end: date, out_dir: Path,
             timeout_s: int, logger=print) -> dict:
     # 先停在下载中心取当前时间作为基线：平台记录 id 不递增，只能用提交时间判断
     dc.goto(DOWNLOAD_CENTER, wait_until="domcontentloaded", timeout=60000)
@@ -208,7 +275,11 @@ def run_one(ctx, dc: Page, mode: str, start: date, out_dir: Path,
     if mode == "week":
         pick_week(page, start, logger)
     else:
-        pick_preset(page, "近30日", logger)
+        try:
+            pick_range(page, start, end, logger)
+        except Exception as exc:  # noqa: BLE001
+            logger(f"[syt] 自定义区间失败（{exc}），回退「近30日」预设")
+            pick_preset(page, "近30日", logger)
     click_export(page, logger)
     page.close()
 
@@ -225,19 +296,28 @@ def run_one(ctx, dc: Page, mode: str, start: date, out_dir: Path,
 
 
 def run_export(cfg: dict, out_dir: Path | None = None, modes=("week", "range"),
-               timeout_s: int = 300, logger=print) -> dict:
-    """供工作台调用：下载生意通商品列表"""
+               timeout_s: int = 300, logger=print,
+               week_start: date | None = None, week_end: date | None = None,
+               range_start: date | None = None, range_end: date | None = None) -> dict:
+    """供工作台调用：下载生意通商品列表（区间按传入日期走「自定义」）"""
     profile = Path(cfg.get("_profile_dir") or (kx.PROFILES_DIR / "syt"))
     out_dir = Path(out_dir) if out_dir else (kx.DATA_DIR / "syt")
     profile.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     w_start, w_end = last_week()
+    if week_start:
+        w_start = week_start
+    if week_end:
+        w_end = week_end
+    yesterday = date.today() - timedelta(days=1)
+    r_start = range_start or (yesterday - timedelta(days=29))
+    r_end = range_end or yesterday
     jobs = []
     if "week" in modes:
         jobs.append(("week", w_start, w_end))
     if "range" in modes:
-        jobs.append(("range", w_start, w_end))
+        jobs.append(("range", r_start, r_end))
 
     results, errors = [], []
     with sync_playwright() as p:
@@ -249,10 +329,10 @@ def run_export(cfg: dict, out_dir: Path | None = None, modes=("week", "range"),
         try:
             for mode, s, e in jobs:
                 label = (f"上一周({date_label(s, e)})" if mode == "week"
-                         else "近30日(平台口径)")
+                         else f"自定义({date_label(s, e)})")
                 logger(f"[syt] 开始：{label}")
                 try:
-                    results.append(run_one(ctx, dc, mode, s, out_dir, timeout_s, logger))
+                    results.append(run_one(ctx, dc, mode, s, e, out_dir, timeout_s, logger))
                 except Exception as exc:  # noqa: BLE001
                     logger(f"[syt] 失败：{label} -> {type(exc).__name__}: {str(exc)[:200]}")
                     errors.append({"mode": mode, "error": str(exc)[:300]})
@@ -269,7 +349,7 @@ def run_export(cfg: dict, out_dir: Path | None = None, modes=("week", "range"),
     for e in errors:
         logger(f"  x {e['mode']}  {e['error'][:120]}")
     return {"files": results, "errors": errors, "out_dir": str(out_dir),
-            "week": date_label(w_start, w_end)}
+            "week": date_label(w_start, w_end), "range": date_label(r_start, r_end)}
 
 
 def main() -> int:

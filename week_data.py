@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime
 from pathlib import Path
 
@@ -44,13 +45,40 @@ def _export_ok(start: str, end: str) -> Path | None:
     return csv
 
 
-def _syt_file(day: date) -> Path | None:
+SYT_NAME_RE = re.compile(r"商品列表(\d{8})_(\d{8})_")
+
+
+def _syt_file(day: date, tolerance_days: int = 3) -> Path | None:
+    """找最接近指定起始日的生意通文件（平台窗口可能与程序口径差 1 天）"""
     d = kx.DATA_DIR / "syt"
     if not d.exists():
         return None
-    cands = sorted(d.glob(f"商品列表{day:%Y%m%d}_*.xlsx"),
-                   key=lambda p: p.stat().st_mtime, reverse=True)
-    return cands[0] if cands else None
+    best = None
+    best_gap = tolerance_days + 1
+    for p in d.glob("商品列表*_*.xlsx"):
+        m = SYT_NAME_RE.match(p.name)
+        if not m:
+            continue
+        try:
+            start = datetime.strptime(m.group(1), "%Y%m%d").date()
+        except ValueError:
+            continue
+        gap = abs((start - day).days)
+        if gap < best_gap or (gap == best_gap and best is not None
+                              and p.stat().st_mtime > best.stat().st_mtime):
+            best, best_gap = p, gap
+    return best
+
+
+def _syt_range(p: Path) -> tuple[date, date] | None:
+    m = SYT_NAME_RE.match(p.name)
+    if not m:
+        return None
+    try:
+        return (datetime.strptime(m.group(1), "%Y%m%d").date(),
+                datetime.strptime(m.group(2), "%Y%m%d").date())
+    except ValueError:
+        return None
 
 
 def _read_items(cfg: dict) -> list[tuple[str, str]]:
@@ -153,13 +181,28 @@ def collect(cfg: dict, start: str, end: str, range_start: str, range_end: str,
         logger(f"[week] 复用生意通文件: {syt_week.name} / {syt_range.name}")
     else:
         logger("[week] 下载生意通数据（上一周 + 近30日）")
-        res = export_syt.run_export(cfg, logger=logger)
+        res = export_syt.run_export(cfg, logger=logger,
+                                    week_start=d_start, week_end=d_end,
+                                    range_start=d_rs, range_end=d_re)
         if res.get("errors"):
             raise RuntimeError(f"生意通下载失败: {res['errors'][0].get('error')}")
-        syt_week = _syt_file(d_start)
-        syt_range = _syt_file(d_rs)
+        out_dir = Path(res.get("out_dir") or (kx.DATA_DIR / "syt"))
+        by_mode = {f.get("mode"): out_dir / str(f.get("file"))
+                   for f in res.get("files") or [] if f.get("file")}
+        syt_week = by_mode.get("week") or _syt_file(d_start)
+        syt_range = by_mode.get("range") or _syt_file(d_rs)
     if not syt_week or not syt_range:
-        raise RuntimeError("生意通文件缺失")
+        have = sorted(p.name for p in (kx.DATA_DIR / "syt").glob("商品列表*.xlsx"))[-3:]
+        raise RuntimeError(f"生意通文件缺失（周={d_start}，30日={d_rs}；"
+                           f"现有文件：{have or '无'}）")
+
+    # 生意通窗口可能与程序口径差几天（如「近30日」截至昨天），日志提示
+    for tag, p, expect in (("上一周", syt_week, (d_start, d_end)),
+                           ("近30日", syt_range, (d_rs, d_re))):
+        rng = _syt_range(p)
+        if rng and rng != expect:
+            logger(f"[week] 注意：生意通{tag}窗口 {rng[0]}~{rng[1]} 与金牛 "
+                   f"{expect[0]}~{expect[1]} 不一致，退款率按生意通口径")
 
     # 4) 汇总
     products = _read_items(cfg)
