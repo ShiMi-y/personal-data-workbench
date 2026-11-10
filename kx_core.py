@@ -38,7 +38,7 @@ else:
     BUNDLE_DIR = BASE
 
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 PROFILE_DIR = BASE / ".browser_profile"
 PROFILES_DIR = BASE / ".browser_profiles"
 DATA_DIR = BASE / "data"
@@ -154,6 +154,8 @@ def load_config(path: Path | None = None) -> dict:
     cfg.setdefault("update_repo", "")
     cfg.setdefault("update_source", "github")
     cfg.setdefault("update_webdav_path", "/version.json")
+    cfg.setdefault("update_github_mirror_enabled", False)
+    cfg.setdefault("update_github_mirror", "https://ghproxy.net/")
     cfg.setdefault("realtime_auto_refresh", False)
     cfg.setdefault("realtime_interval_minutes", 5)
     cfg.setdefault("realtime_window_start", "08:50")
@@ -231,10 +233,13 @@ def _normalize_accounts(cfg: dict) -> bool:
         for k, v in (("login_role", "auto"), ("enabled", True),
                      ("include_accounts", []), ("exclude_accounts", []),
                      ("alert_thresholds", {}), ("legacy_profile", False),
-                     ("roi_book_path", "")):
+                     ("roi_book_path", ""), ("alert_cooldown_minutes", 30)):
             if k not in a:
                 a[k] = v
                 changed = True
+        if "week_cost_source" in a:
+            a.pop("week_cost_source", None)
+            changed = True
         password = str(a.get("password") or "")
         if password and not app_secret.is_protected(password):
             try:
@@ -304,7 +309,6 @@ def account_cfg(cfg: dict, acct: dict) -> dict:
         "login_role": str(acct.get("login_role") or "auto"),
         "excel_path": str(acct.get("excel_path") or ""),
         "roi_book_path": str(acct.get("roi_book_path") or ""),
-        "week_cost_source": str(acct.get("week_cost_source") or "both"),
         "include_accounts": list(acct.get("include_accounts") or []),
         "exclude_accounts": list(acct.get("exclude_accounts") or []),
         "alert_thresholds": dict(acct.get("alert_thresholds") or {}),

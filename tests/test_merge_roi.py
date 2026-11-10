@@ -38,7 +38,7 @@ class RoiTestBase(unittest.TestCase):
         kx.DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.book = self.root / "核算表.xlsx"
         self.week_csv = self.root / "week.csv"
-        self.prev_csv = self.root / "prev.csv"
+        self.range_csv = self.root / "range.csv"
         self.syt_week = self.root / "syt_week.xlsx"
         self.syt_range = self.root / "syt_range.xlsx"
         self.cfg = {"roi_book_path": str(self.book), "auto_backup": False}
@@ -118,18 +118,18 @@ class RoiTestBase(unittest.TestCase):
         wb.save(self.book)
         wb.close()
 
-    def prepare(self, week_cost=100, week_gmv=200, prev_cost=100, prev_gmv=200,
+    def prepare(self, week_cost=100, week_gmv=200, range_cost=300, range_gmv=600,
                 week_rate=0.1356, range_rate=0.1604) -> None:
         self.build_book()
         self._write_csv(self.week_csv, week_cost, week_gmv)
-        self._write_csv(self.prev_csv, prev_cost, prev_gmv)
+        self._write_csv(self.range_csv, range_cost, range_gmv)
         self._write_syt(self.syt_week, week_rate)
         self._write_syt(self.syt_range, range_rate)
 
     def run_it(self, **kw):
         return merge_roi.run_merge(
             self.cfg, "2026-11-02", "2026-11-08", "2026-10-10", "2026-11-08",
-            book_path=self.book, week_csv=self.week_csv, prev_csv=self.prev_csv,
+            book_path=self.book, week_csv=self.week_csv, range_csv=self.range_csv,
             syt_week=self.syt_week, syt_range=self.syt_range,
             backup=False, save=True, logger=lambda _m: None, **kw)
 
@@ -169,8 +169,8 @@ class MergeRoiTests(RoiTestBase):
         self.assertEqual(ws["J12"].value, "10.10-11.8")
         self.assertEqual(ws["D12"].value, 100)
         self.assertEqual(ws["E12"].value, 200)
-        self.assertEqual(ws["M12"].value, 200)
-        self.assertEqual(ws["N12"].value, 400)
+        self.assertEqual(ws["M12"].value, 300)
+        self.assertEqual(ws["N12"].value, 600)
         self.assertEqual(ws["F12"].value, "='1'!BA4")
         self.assertEqual(ws["G12"].value, "=E12/D12")
         self.assertEqual(ws["H12"].value, "=E12/F12-D12")
@@ -221,7 +221,7 @@ class MergeRoiTests(RoiTestBase):
             merge_roi.run_merge(
                 {"roi_book_path": ""}, "2026-11-02", "2026-11-08",
                 "2026-10-10", "2026-11-08",
-                week_csv=self.week_csv, prev_csv=self.prev_csv,
+                week_csv=self.week_csv, range_csv=self.range_csv,
                 syt_week=self.syt_week, syt_range=self.syt_range,
                 backup=False, save=False, logger=lambda _m: None)
 

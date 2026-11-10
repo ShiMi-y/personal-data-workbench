@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -14,7 +14,6 @@ from openpyxl import load_workbook
 import export_full
 import export_syt
 import kx_core as kx
-import merge_excel
 import merge_roi
 
 PREVIEW_DIR = kx.DATA_DIR / "week_preview"
@@ -79,51 +78,34 @@ def _read_items(cfg: dict) -> list[tuple[str, str]]:
         wb.close()
 
 
-def read_month_cost(path: Path | None, pids: list[str], start: str, end: str) -> dict:
-    """从月度表「消耗成交」读指定商品区间消耗，返回 value/missing/days"""
-    if not path or not Path(path).exists():
-        return {pid: {"value": 0.0, "missing": [], "days": 0} for pid in pids}
-    wb = load_workbook(path, data_only=True)
+def _export_summary(start: str, end: str) -> dict:
+    p = kx.DATA_DIR / "exports" / f"{start}_{end}" / "summary.json"
+    if not p.exists():
+        return {}
     try:
-        sheet = merge_excel.SHEET if merge_excel.SHEET in wb.sheetnames else wb.sheetnames[0]
-        ws = wb[sheet]
-        _total_start, cost_cols, total_row = merge_excel._layout(ws)
-        pid_col = {}
-        for col in cost_cols:
-            pid = merge_excel._cell_id(ws.cell(row=2, column=col).value)
-            if pid:
-                pid_col[pid] = col
-        d0, d1 = _parse(start), _parse(end)
-        days = list(range(d0.day, d1.day + 1))
-        out = {}
-        for pid in pids:
-            col = pid_col.get(pid)
-            if not col:
-                out[pid] = {"value": 0.0, "missing": [
-                    f"{d0.year}-{d0.month:02d}-{day:02d}" for day in days], "days": len(days)}
-                continue
-            s = 0.0
-            missing = []
-            for day in days:
-                r = day + merge_excel.FIRST_DATA_ROW - 1
-                v = ws.cell(row=r, column=col).value if r <= total_row - 1 else None
-                if isinstance(v, (int, float)):
-                    s += float(v)
-                else:
-                    missing.append(f"{d0.year}-{d0.month:02d}-{day:02d}")
-            out[pid] = {"value": round(s, 2), "missing": missing, "days": len(days)}
-        return out
-    finally:
-        wb.close()
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _export_failures(start: str, end: str, range_key: str) -> list[dict]:
+    out = []
+    for f in _export_summary(start, end).get("failures") or []:
+        out.append({
+            "range": range_key,
+            "account_id": str(f.get("account_id") or ""),
+            "account_name": str(f.get("account_name") or ""),
+            "error": str(f.get("error") or "")[:300],
+        })
+    return out
 
 
 def check_cache(start: str, end: str, range_start: str, range_end: str) -> dict:
     """检查四项数据是否已存在，供前端提示用户是否复用"""
     d_start = _parse(start)
     d_rs = _parse(range_start)
-    prev_end = (d_start - timedelta(days=1)).isoformat()
     out: dict = {}
-    for key, s, e in (("week_csv", start, end), ("prev_csv", range_start, prev_end)):
+    for key, s, e in (("week_csv", start, end), ("range_csv", range_start, range_end)):
         p = kx.DATA_DIR / "exports" / f"{s}_{e}" / "products.csv"
         out[key] = ({"exists": True, "path": str(p),
                      "mtime": datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")}
@@ -141,29 +123,28 @@ def collect(cfg: dict, start: str, end: str, range_start: str, range_end: str,
             reuse: bool = True, logger=_log_default) -> dict:
     d_start, d_end = _parse(start), _parse(end)
     d_rs, d_re = _parse(range_start), _parse(range_end)
-    prev_end = (d_start - timedelta(days=1)).isoformat()
 
-    # 1) 磁力金牛 7 日段（逐日，区间 groupType=1 实测数据重复/遗漏，不可用）
+    # 1) 磁力金牛 7 日段（区间接口 groupType=1，按天返回，与逐日结果一致）
     week_csv = _export_ok(start, end) if reuse else None
     if week_csv:
         logger(f"[week] 复用已有导出: {week_csv}")
     else:
-        logger(f"[week] 取磁力金牛 {start}~{end}")
-        export_full.run_export(cfg, start, end, None, logger=logger)
+        logger(f"[week] 取磁力金牛 {start}~{end}（区间）")
+        export_full.run_export(cfg, start, end, None, logger=logger, range_mode=True)
         week_csv = _export_ok(start, end)
     if not week_csv:
         raise RuntimeError("磁力金牛 7 日数据导出失败")
 
-    # 2) 磁力金牛 30 日历史段
-    prev_csv = _export_ok(range_start, prev_end) if reuse else None
-    if prev_csv:
-        logger(f"[week] 复用已有导出: {prev_csv}")
+    # 2) 磁力金牛 30 日段（整段一次区间查询，不再由 7 日 + 历史段拼接）
+    range_csv = _export_ok(range_start, range_end) if reuse else None
+    if range_csv:
+        logger(f"[week] 复用已有导出: {range_csv}")
     else:
-        logger(f"[week] 取磁力金牛 {range_start}~{prev_end}")
-        export_full.run_export(cfg, range_start, prev_end, None, logger=logger)
-        prev_csv = _export_ok(range_start, prev_end)
-    if not prev_csv:
-        raise RuntimeError("磁力金牛 30 日历史数据导出失败")
+        logger(f"[week] 取磁力金牛 {range_start}~{range_end}（区间）")
+        export_full.run_export(cfg, range_start, range_end, None, logger=logger, range_mode=True)
+        range_csv = _export_ok(range_start, range_end)
+    if not range_csv:
+        raise RuntimeError("磁力金牛 30 日数据导出失败")
 
     # 3) 生意通
     syt_week = _syt_file(d_start) if reuse else None
@@ -183,7 +164,7 @@ def collect(cfg: dict, start: str, end: str, range_start: str, range_end: str,
     # 4) 汇总
     products = _read_items(cfg)
     week = merge_roi.read_products(week_csv)
-    prev = merge_roi.read_products(prev_csv)
+    range_rows = merge_roi.read_products(range_csv)
 
     targets = {pid for pid, _n in products}
     week_rate = merge_roi.read_syt_rates(syt_week, targets)
@@ -192,47 +173,30 @@ def collect(cfg: dict, start: str, end: str, range_start: str, range_end: str,
     if missing:
         raise RuntimeError(f"生意通缺少商品退款率: {sorted(missing)}")
 
-    source = str(cfg.get("week_cost_source") or "both").strip().lower()
-    if source not in ("month", "niu", "both"):
-        source = "both"
     items = []
-    month_path = kx.resolve_path(cfg["excel_path"]) if cfg.get("excel_path") else None
-    pids = [p for p, _n in products]
-    m7 = read_month_cost(month_path, pids, start, end)
-    m30 = read_month_cost(month_path, pids, range_start, range_end)
     for pid, name in products:
         w = week.get(pid, [0.0, 0.0])
-        p = prev.get(pid, [0.0, 0.0])
-        niu7 = round(w[0], 2)
-        niu30 = round(w[0] + p[0], 2)
-        d7 = m7.get(pid) or {"value": 0.0, "missing": [], "days": 0}
-        d30 = m30.get(pid) or {"value": 0.0, "missing": [], "days": 0}
+        r30 = range_rows.get(pid, [0.0, 0.0])
         items.append({
             "product_id": pid,
             "product_name": name,
-            "cost7": d7["value"] if source == "month" else niu7,
-            "cost7_niu": niu7,
-            "cost7_month": d7["value"],
-            "cost30_niu": niu30,
-            "cost30_month": d30["value"],
-            "missing7": d7["missing"],
-            "missing30": d30["missing"],
-            "incomplete7": bool(d7["missing"]),
-            "incomplete30": bool(d30["missing"]),
+            "cost7": round(w[0], 2),
+            "cost30": round(r30[0], 2),
             "gmv7": round(w[1], 2),
+            "gmv30": round(r30[1], 2),
             "rate7": week_rate[pid],
-            "cost30": d30["value"] if source == "month" else niu30,
-            "gmv30": round(w[1] + p[1], 2),
             "rate30": range_rate[pid],
         })
+
+    failures = _export_failures(start, end, "7") + _export_failures(range_start, range_end, "30")
 
     data = {
         "start": start, "end": end,
         "range_start": range_start, "range_end": range_end,
-        "cost_source": source,
         "label7": merge_roi.date_label(d_start, d_end),
         "label30": merge_roi.date_label(d_rs, d_re),
         "items": items,
+        "failures": failures,
         "totals": {
             "cost7": round(sum(x["cost7"] for x in items), 2),
             "gmv7": round(sum(x["gmv7"] for x in items), 2),
@@ -240,15 +204,27 @@ def collect(cfg: dict, start: str, end: str, range_start: str, range_end: str,
             "gmv30": round(sum(x["gmv30"] for x in items), 2),
         },
         "files": {
-            "week_csv": str(week_csv), "prev_csv": str(prev_csv),
+            "week_csv": str(week_csv), "range_csv": str(range_csv),
             "syt_week": str(syt_week), "syt_range": str(syt_range),
         },
         "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     save_preview(data)
-    logger(f"[week] 预览就绪：{len(items)} 个商品，7日花费 {data['totals']['cost7']}，"
-           f"30日花费 {data['totals']['cost30']}")
+    logger(f"[week] 预览就绪：{len(items)} 个商品，7日消耗 {data['totals']['cost7']}，"
+           f"30日消耗 {data['totals']['cost30']}")
+    if failures:
+        logger(f"[week] 有 {len(failures)} 个账户区间数据失败，合计可能偏小，可在预览里重试")
     return data
+
+
+def retry(cfg: dict, start: str, end: str, range_start: str, range_end: str,
+          range_key: str, account_ids: list[str], logger=_log_default) -> dict:
+    """手动重试：只重抓指定区间里失败的账户，并合并回已有导出"""
+    seg = {"7": (start, end), "30": (range_start, range_end)}
+    if range_key not in seg:
+        raise ValueError("range 只能是 7 或 30")
+    s, e = seg[range_key]
+    return export_full.retry_accounts(cfg, s, e, account_ids, logger=logger)
 
 
 def preview_path(start: str, end: str) -> Path:

@@ -268,7 +268,7 @@
   <section class="panel" id="panel-week">
   <section class="card">
     <h2>周数据导出 <span class="badge gray" id="wkPeriod">-</span></h2>
-    <div class="hint">从生意通下载「上一周」和「近30日」商品列表，再把退款率写入核算表的「退款率」「盈利」两张子表。周期标签按日期自动生成。</div>
+    <div class="hint">磁力金牛按区间拉取 7 日 / 30 日消耗与成交，生意通下载「上一周」「近30日」商品列表，再把退款率写入核算表的「退款率」「盈利」两张子表。失败账户会自动重试，仍失败可在预览里单独重试。</div>
     <div class="weekdates">
       <div class="weekrow">
         <span class="wk-label">本周周一</span>
@@ -361,16 +361,13 @@
         </div>
       </div>
       <div class="field">
-        <label>周数据金牛取数维度</label>
-        <select id="accWeekSource">
-          <option value="both">双渠道检验（月度表 + 金牛）</option>
-          <option value="month">月度表</option>
-          <option value="niu">磁力金牛</option>
-        </select>
-      </div>
-      <div class="field">
         <label>启用</label>
         <label class="switchline"><input type="checkbox" id="accEnabled" checked /> 参与批量取数与合并</label>
+      </div>
+      <div class="field">
+        <label>预警冷却时间（分钟）</label>
+        <input type="number" id="accCooldown" min="0" max="1440" value="30" />
+        <span class="hint">同一账户超线后冷却期内不重复弹窗；0 = 每次抓取都提醒</span>
       </div>
       <div class="field wide">
         <label>强制包含账户 include_accounts（逗号分隔，可空）</label>
@@ -475,6 +472,13 @@
           <label>GitHub 仓库 update_repo（owner/repo）</label>
           <input type="text" id="cfgUpdateRepo" placeholder="your-name/personal-data-workbench" />
           <span class="hint" style="margin-top:4px">必填，格式 owner/repo（如 ShiMi-y/personal-data-workbench）；私有仓库需在系统环境变量里设置 GITHUB_TOKEN</span>
+          <label class="switchline" style="margin-top:10px"><input type="checkbox" id="cfgGhMirror" /> 升级包下载使用 GitHub 镜像</label>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:7px;align-items:center">
+            <input type="text" id="cfgGhMirrorUrl" placeholder="https://ghproxy.net/" style="flex:1;min-width:240px" />
+            <button class="ghost" id="btnSpeedTest">测速（直连 vs 镜像）</button>
+            <span class="hint" id="speedHint" style="margin-top:0"></span>
+          </div>
+          <span class="hint">勾选后仅升级包下载拼接镜像前缀，检查更新仍直连 api.github.com；测速各取样最多 8 秒 / 12MB</span>
         </div>
         <div class="field wide" id="davUpdateBox" style="display:none">
           <label>WebDAV 连接（地址 / 账号 / 密码，仅保存在本机加密文件，不进安装包）</label>
@@ -621,6 +625,8 @@ async function loadConfig() {
     $('#cfgVersion').value = c.version || '1.0.0';
     $('#cfgUpdateSource').value = c.update_source || 'github';
     $('#cfgUpdateRepo').value = c.update_repo || '';
+    $('#cfgGhMirror').checked = !!c.update_github_mirror_enabled;
+    $('#cfgGhMirrorUrl').value = c.update_github_mirror || 'https://ghproxy.net/';
     $('#cfgDavUrl').value = c.webdav_url || '';
     $('#cfgDavUser').value = c.webdav_username || '';
     $('#cfgDavPass').value = '';
@@ -670,6 +676,8 @@ async function saveConfig() {
     version: $('#cfgVersion').value.trim(),
     update_repo: $('#cfgUpdateRepo').value.trim(),
     update_source: $('#cfgUpdateSource').value,
+    update_github_mirror_enabled: $('#cfgGhMirror').checked,
+    update_github_mirror: $('#cfgGhMirrorUrl').value.trim(),
     update_webdav_path: $('#cfgDavPath').value.trim(),
     auto_backup: $('#cfgAutoBackup').checked,
     backup_limit: Number($('#cfgBackupLimit').value),
@@ -691,6 +699,27 @@ async function saveConfig() {
     $('#cfgHint').textContent = `已保存 ${t}`;
   } catch (e) {
     $('#cfgHint').textContent = '保存失败：' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function runSpeedTest() {
+  const btn = $('#btnSpeedTest');
+  const hint = $('#speedHint');
+  btn.disabled = true;
+  hint.textContent = '测速中（直连与镜像各取样最多 8 秒）…';
+  try {
+    const r = await api('/api/update/speedtest');
+    hint.textContent = ['direct', 'mirror'].map((k) => {
+      const x = (r.results || {})[k] || {};
+      const name = k === 'direct' ? '直连' : '镜像';
+      return x.ok
+        ? `${name} ${x.speed_mbps} MB/s（${x.seconds}s，首字节 ${x.ttfb}s）`
+        : `${name} 失败：${x.error || '未知错误'}`;
+    }).join(' · ');
+  } catch (e) {
+    hint.textContent = '测速失败：' + e.message;
   } finally {
     btn.disabled = false;
   }
@@ -953,7 +982,6 @@ async function loadState() {
   updateAlertBadge();
   state.defaultDate = st.default_date;
   if (st.version) $('#verBadge').textContent = 'v' + st.version;
-  renderRealtime(st.realtime || null);
   $('#date').value = st.default_date;
   $('#start').value = st.default_date;
   $('#end').value = st.default_date;
@@ -971,6 +999,8 @@ async function loadState() {
   renderOwnerChips();
   renderAccountList();
   renderAccounts(st.accounts || [], state.excelAccounts);
+  // 必须放在账户缓存赋值之后：实时表要用它补齐当日零消耗/拉取失败的账户行
+  renderRealtime(st.realtime || null);
   if (!state.accounts.length && state.loginAccounts.length) {
     refreshAccounts(true);
   }
@@ -1035,12 +1065,14 @@ function renderAccountList() {
       : (a.roi_book_exists ? '<span class="badge ok">核算表已就绪</span>' : '<span class="badge err">核算表未找到</span>');
     const disabled = a.enabled ? '' : '<span class="badge gray">已停用</span>';
     const alertN = Object.keys(a.alert_thresholds || {}).length;
+    const cd = Number(a.alert_cooldown_minutes ?? 30);
     return `<div class="accitem">
       <div class="top">
         <b>${escapeHtml(a.label)}</b>
         <span class="muted">${phone}</span>
         ${excelBadge} ${roiBadge} ${disabled}
         <span class="badge gray">${alertN ? '预警 ' + alertN + ' 个' : '无预警线'}</span>
+        <span class="badge gray">${cd > 0 ? '冷却 ' + cd + ' 分钟' : '冷却关闭'}</span>
       </div>
       ${excel}
       ${roi}
@@ -1066,8 +1098,8 @@ function openAccountForm(id) {
   $('#accRole').value = a ? a.login_role : 'auto';
   $('#accExcel').value = a ? a.excel_path : '';
   $('#accRoiBook').value = a ? (a.roi_book_path || '') : '';
-  $('#accWeekSource').value = a ? (a.week_cost_source || 'both') : 'both';
   $('#accEnabled').checked = a ? a.enabled : true;
+  $('#accCooldown').value = a ? (a.alert_cooldown_minutes ?? 30) : 30;
   $('#accInclude').value = a ? (a.include_accounts || []).join(',') : '';
   $('#accExclude').value = a ? (a.exclude_accounts || []).join(',') : '';
   $('#accFormHint').textContent = '';
@@ -1091,8 +1123,8 @@ async function saveAccount() {
     login_role: $('#accRole').value,
     excel_path: excel,
     roi_book_path: roiBook,
-    week_cost_source: $('#accWeekSource').value,
     enabled: $('#accEnabled').checked,
+    alert_cooldown_minutes: Number($('#accCooldown').value),
     include_accounts: $('#accInclude').value,
     exclude_accounts: $('#accExclude').value,
   };
@@ -1209,16 +1241,18 @@ async function saveAlertThresholds() {
     if (!owner) return;
     if (!groups[owner]) groups[owner] = {};
     const v = inp.value.trim();
-    if (v !== '' && Number(v) > 0) groups[owner][inp.dataset.id] = Number(v);
+    // 留空/0 表示取消该账户预警线；未渲染的账户不在提交范围内，后端保持原配置
+    groups[owner][inp.dataset.id] = (v !== '' && Number(v) > 0) ? Number(v) : 0;
   });
   try {
     for (const [owner, th] of Object.entries(groups)) {
-      await api('/api/login-accounts/save', {
+      const r = await api('/api/login-accounts/save', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: owner, alert_thresholds: th }),
       });
       const a = state.loginAccounts.find((x) => String(x.id) === String(owner));
-      if (a) a.alert_thresholds = th;
+      const updated = (r.login_accounts || []).find((x) => String(x.id) === String(owner));
+      if (a && updated) a.alert_thresholds = updated.alert_thresholds || {};
     }
     reevaluateAlerts();
   } catch (e) {
@@ -1228,20 +1262,6 @@ async function saveAlertThresholds() {
 
 function reevaluateAlerts() {
   if (!state.realtime) { updateAlertBadge(); return; }
-  const th = alertThresholds();
-  const alerts = (state.realtime.accounts || []).filter((a) => {
-    const lim = Number(th[a.account_id] || 0);
-    return lim > 0 && Number(a.cost) > lim;
-  }).map((a) => ({
-    account_id: a.account_id,
-    account_name: a.account_name || '',
-    product_name: a.product_name || '',
-    owner_id: a.owner_id || '',
-    owner_label: a.owner_label || '',
-    cost: Number(a.cost),
-    limit: Number(th[a.account_id]),
-  }));
-  state.realtime.alerts = alerts;
   renderRealtime(state.realtime);
 }
 
@@ -1263,6 +1283,7 @@ async function refreshAccounts(silent) {
       if (job.status === 'done' || job.status === 'error') {
         if (job.status === 'error') { logLine('获取失败：' + job.error, true); break; }
         renderAccounts(job.result.accounts || [], state.excelAccounts);
+        renderRealtime(state.realtime);
         logLine(`账户已更新：${(job.result.accounts || []).length} 个`);
         break;
       }
@@ -1292,27 +1313,62 @@ function renderRealtime(d) {
   const accs = visible(d.accounts);
   const prods = visible(d.products);
   const failures = visible(d.failures);
-  const cost = accs.reduce((s, a) => s + Number(a.cost || 0), 0);
-  const gmv = accs.reduce((s, a) => s + Number(a.gmv || 0), 0);
+  // 用账户缓存补齐当日零消耗/拉取失败的账户，保证每个账户都能看到并设置预警线
+  const seen = new Set(accs.map((a) => `${a.owner_id || ''}|${a.account_id}`));
+  const failSet = new Set(failures.map((f) => `${f.owner_id || ''}|${f.account_id || ''}`));
+  const zeros = (state.accounts || []).filter((a) => {
+    const oid = String(a.owner_id || '');
+    if (onlySel && !ownerSet.has(oid)) return false;
+    return !seen.has(`${oid}|${String(a.id)}`);
+  }).map((a) => {
+    const oid = String(a.owner_id || '');
+    const aid = String(a.id);
+    return {
+      date: d.date || '', account_id: aid, account_name: a.name || '',
+      cost: 0, gmv: 0, roi: 0, order_cnt: 0, product_count: 0,
+      product_id: '', product_name: '',
+      owner_id: oid, owner_label: a.owner_label || '',
+      zero: true, failed: failSet.has(`${oid}|${aid}`) || failSet.has(`${oid}|`),
+    };
+  });
+  const accsAll = accs.concat(zeros);
+  const cost = accsAll.reduce((s, a) => s + Number(a.cost || 0), 0);
+  const gmv = accsAll.reduce((s, a) => s + Number(a.gmv || 0), 0);
   const t = {
     ...(d.totals || {}),
     cost: Math.round(cost * 100) / 100,
     gmv: Math.round(gmv * 100) / 100,
     roi: cost ? Math.round((gmv / cost) * 100) / 100 : 0,
-    order_cnt: accs.reduce((s, a) => s + Number(a.order_cnt || 0), 0),
-    account_rows: accs.length,
+    order_cnt: accsAll.reduce((s, a) => s + Number(a.order_cnt || 0), 0),
+    account_rows: accsAll.length,
     product_rows: prods.length,
   };
   dateEl.textContent = d.date || '';
+  const zeroN = zeros.filter((x) => !x.failed).length;
   timeEl.innerHTML = `抓取时间 <b>${escapeHtml(d.fetched_at || '-')}</b> · 用时 ${d.elapsed}s · `
     + `${t.account_rows} 账户 / ${t.product_rows} 商品行`
+    + (zeroN ? ` · 其中 ${zeroN} 个当日无消耗` : '')
     + (failures.length ? ` · <span style="color:var(--err)">失败 ${failures.length} 个</span>` : '');
   stats.innerHTML = `
     <div class="stat"><div class="k">消耗合计</div><div class="v">${fmt(t.cost)}<small>元</small></div></div>
     <div class="stat"><div class="k">成交合计</div><div class="v">${fmt(t.gmv)}<small>元</small></div></div>
     <div class="stat"><div class="k">整体 ROI</div><div class="v">${fmt(t.roi)}</div></div>
     <div class="stat"><div class="k">成交订单</div><div class="v">${t.order_cnt || 0}<small>单</small></div></div>`;
-  const alerts = visible(d.alerts);
+  // 预警按当前预警线实时重算，不直接采用缓存里的旧告警（取消预警线后刷新不再复活）
+  const th = alertThresholds();
+  const alerts = accsAll.filter((a) => {
+    const lim = Number(th[a.account_id] || 0);
+    return lim > 0 && Number(a.cost) > lim;
+  }).map((a) => ({
+    account_id: a.account_id,
+    account_name: a.account_name || '',
+    product_name: a.product_name || '',
+    owner_id: a.owner_id || '',
+    owner_label: a.owner_label || '',
+    cost: Number(a.cost),
+    limit: Number(th[a.account_id]),
+  }));
+  d.alerts = alerts;
   const banner = $('#alertBanner');
   if (banner) {
     if (alerts.length) {
@@ -1327,15 +1383,20 @@ function renderRealtime(d) {
     }
   }
   const overIds = new Set(alerts.map((x) => `${x.owner_id || ''}|${x.account_id}`));
-  const rtMultiOwner = new Set(accs.map((a) => a.owner_label || '')).size > 1;
-  const rows = accs.map((a) => {
+  const rtMultiOwner = new Set(accsAll.map((a) => a.owner_label || '')).size > 1;
+  const rows = accsAll.map((a) => {
     const name = a.account_name || a.account_id || '';
+    const tag = a.failed
+      ? ' <span class="badge err" title="今日实时数据拉取失败，数值未知">拉取失败</span>'
+      : (a.zero ? ' <span class="badge gray">无消耗</span>' : '');
+    const cell = (val) => (a.failed ? '-' : fmt(val));
+    const cnt = (val) => (a.failed ? '-' : val);
     return `<tr${overIds.has(`${a.owner_id || ''}|${a.account_id}`) ? ' class="over"' : ''}>
       ${rtMultiOwner ? `<td>${escapeHtml(a.owner_label || '-')}</td>` : ''}
-      <td>${escapeHtml(name)}<span class="muted"> ${escapeHtml(String(a.account_id))}</span></td>
-      <td class="num">${fmt(a.cost)}</td><td class="num">${fmt(a.gmv)}</td>
-      <td class="num">${fmt(a.roi)}</td><td class="num">${a.order_cnt}</td>
-      <td class="num">${a.product_count}</td>
+      <td>${escapeHtml(name)}<span class="muted"> ${escapeHtml(String(a.account_id))}</span>${tag}</td>
+      <td class="num">${cell(a.cost)}</td><td class="num">${cell(a.gmv)}</td>
+      <td class="num">${cell(a.roi)}</td><td class="num">${cnt(a.order_cnt)}</td>
+      <td class="num">${cnt(a.product_count)}</td>
       <td class="num"><input class="alertinput" type="number" min="0" step="0.01" placeholder="不预警"
         data-id="${a.account_id}" data-owner="${a.owner_id || ''}" value="${alertThresholds()[a.account_id] ?? ''}" /></td></tr>`;
   }).join('');
@@ -1709,6 +1770,7 @@ $('#btnRefreshAcc').addEventListener('click', () => refreshAccounts(false));
 $('#btnMerge').addEventListener('click', runMerge);
 $('#btnToggleLog').addEventListener('click', () => showLog(!$('#log').classList.contains('show')));
 $('#btnSaveCfg').addEventListener('click', saveConfig);
+$('#btnSpeedTest').addEventListener('click', runSpeedTest);
 $('#cfgUpdateSource').addEventListener('change', toggleUpdateSource);
 $('#btnDavSave').addEventListener('click', saveDav);
 $('#btnDavTest').addEventListener('click', testDav);
@@ -1833,76 +1895,77 @@ async function pollJob(jid, onLog) {
   }
 }
 
-function diffClass(a, b) {
-  if (a === null || a === undefined || b === null || b === undefined) return '';
-  return Math.abs(Number(a) - Number(b)) > 0.01 ? 'diff' : '';
-}
-
 function renderWeekPreview(res) {
   const items = res.items || [];
-  if (!items.length) {
-    $('#wkPreview').innerHTML = '<div class="empty">没有取到数据</div>';
-    return;
-  }
-  const src = res.cost_source || 'both';
   const pct = (v) => (v === null || v === undefined) ? '-' : (Number(v) * 100).toFixed(2) + '%';
-  const missTip = (arr) => (arr && arr.length) ? `数据不全，缺 ${arr.length} 天：${arr.join('、')}` : '';
-  const cellMonth = (val, miss) => {
-    const bad = miss && miss.length;
-    return `<td class="${bad ? 'diff' : ''}" title="${escapeHtml(missTip(miss))}">${fmt(val)}${bad ? ' ⚠' : ''}</td>`;
-  };
   const t = res.totals || {};
-  let head = '';
-  let rows = '';
-  let totalRow = '';
-  if (src === 'month') {
-    head = '<th>商品</th><th>7日花费（月度表）</th><th>7日成交</th><th>7日退款率</th>'
-      + '<th>30日花费（月度表）</th><th>30日成交</th><th>30日退款率</th>';
-    rows = items.map((it) => `<tr>
+  let table = '<div class="empty">没有取到数据</div>';
+  if (items.length) {
+    const rows = items.map((it) => `<tr>
       <td>${escapeHtml(it.product_name)}</td>
-      ${cellMonth(it.cost7_month, it.missing7)}
-      <td>${fmt(it.gmv7)}</td><td>${pct(it.rate7)}</td>
-      ${cellMonth(it.cost30_month, it.missing30)}
-      <td>${fmt(it.gmv30)}</td><td>${pct(it.rate30)}</td></tr>`).join('');
-    totalRow = `<tr><td><b>总计</b></td><td><b>${fmt(t.cost7)}</b></td><td><b>${fmt(t.gmv7)}</b></td><td>-</td>`
-      + `<td><b>${fmt(t.cost30)}</b></td><td><b>${fmt(t.gmv30)}</b></td><td>-</td></tr>`;
-  } else if (src === 'niu') {
-    head = '<th>商品</th><th>7日花费（金牛）</th><th>7日成交</th><th>7日退款率</th>'
-      + '<th>30日花费（金牛）</th><th>30日成交</th><th>30日退款率</th>';
-    rows = items.map((it) => `<tr>
-      <td>${escapeHtml(it.product_name)}</td>
-      <td>${fmt(it.cost7_niu)}</td><td>${fmt(it.gmv7)}</td><td>${pct(it.rate7)}</td>
-      <td>${fmt(it.cost30_niu)}</td><td>${fmt(it.gmv30)}</td><td>${pct(it.rate30)}</td></tr>`).join('');
-    totalRow = `<tr><td><b>总计</b></td><td><b>${fmt(t.cost7)}</b></td><td><b>${fmt(t.gmv7)}</b></td><td>-</td>`
-      + `<td><b>${fmt(t.cost30)}</b></td><td><b>${fmt(t.gmv30)}</b></td><td>-</td></tr>`;
-  } else {
-    head = '<th>商品</th><th>7日（月度表）</th><th>7日（金牛）</th><th>7日成交</th><th>7日退款率</th>'
-      + '<th>30日（月度表）</th><th>30日（金牛）</th><th>30日成交</th><th>30日退款率</th>';
-    rows = items.map((it) => {
-      const d7 = diffClass(it.cost7_month, it.cost7_niu);
-      const d30 = diffClass(it.cost30_month, it.cost30_niu);
-      return `<tr>
-        <td>${escapeHtml(it.product_name)}</td>
-        <td class="${d7 || (it.incomplete7 ? 'diff' : '')}" title="${escapeHtml(missTip(it.missing7))}">${fmt(it.cost7_month)}${it.incomplete7 ? ' ⚠' : ''}</td>
-        <td class="${d7}">${fmt(it.cost7_niu)}</td>
-        <td>${fmt(it.gmv7)}</td><td>${pct(it.rate7)}</td>
-        <td class="${d30 || (it.incomplete30 ? 'diff' : '')}" title="${escapeHtml(missTip(it.missing30))}">${fmt(it.cost30_month)}${it.incomplete30 ? ' ⚠' : ''}</td>
-        <td class="${d30}">${fmt(it.cost30_niu)}</td>
-        <td>${fmt(it.gmv30)}</td><td>${pct(it.rate30)}</td></tr>`;
-    }).join('');
-    const sum = (key) => items.reduce((s, it) => s + (it[key] === null || it[key] === undefined ? 0 : Number(it[key])), 0);
-    totalRow = `<tr><td><b>总计</b></td>
-      <td><b>${fmt(sum('cost7_month'))}</b></td><td><b>${fmt(t.cost7)}</b></td>
-      <td><b>${fmt(t.gmv7)}</b></td><td>-</td>
-      <td><b>${fmt(sum('cost30_month'))}</b></td><td><b>${fmt(t.cost30)}</b></td>
-      <td><b>${fmt(t.gmv30)}</b></td><td>-</td></tr>`;
+      <td class="num">${fmt(it.cost7)}</td><td class="num">${fmt(it.gmv7)}</td><td class="num">${pct(it.rate7)}</td>
+      <td class="num">${fmt(it.cost30)}</td><td class="num">${fmt(it.gmv30)}</td><td class="num">${pct(it.rate30)}</td></tr>`).join('');
+    const totalRow = `<tr><td><b>总计</b></td>
+      <td class="num"><b>${fmt(t.cost7)}</b></td><td class="num"><b>${fmt(t.gmv7)}</b></td><td class="num">-</td>
+      <td class="num"><b>${fmt(t.cost30)}</b></td><td class="num"><b>${fmt(t.gmv30)}</b></td><td class="num">-</td></tr>`;
+    table = `<div class="tablebox"><table>
+      <thead><tr><th>商品</th><th>7日消耗（金牛）</th><th>7日成交</th><th>7日退款率</th>
+      <th>30日消耗（金牛）</th><th>30日成交</th><th>30日退款率</th></tr></thead>
+      <tbody>${rows}${totalRow}</tbody></table></div>`;
   }
-  const srcName = { month: '月度表', niu: '磁力金牛', both: '双渠道检验' }[src] || src;
-  $('#wkPreview').innerHTML = `<div class="tablebox"><table>
-    <thead><tr>${head}</tr></thead>
-    <tbody>${rows}${totalRow}</tbody>
-    </table></div>
-    <div class="hint">取数维度：${srcName}；红色 = 差异超过 0.01 或月度表数据不全（⚠ 悬停看缺失日期）；周期：${escapeHtml(res.label7 || '')} / ${escapeHtml(res.label30 || '')}；采集时间 ${escapeHtml(res.collected_at || '')}</div>`;
+  const fails = res.failures || [];
+  let failHtml = '';
+  if (fails.length) {
+    const rows = fails.map((f) => `<div style="display:flex;gap:10px;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px dashed #fee2e2">
+      <span>${f.range === '7' ? '7日' : '30日'} · ${escapeHtml(f.account_name || '')} ${escapeHtml(f.account_id || '')}
+        <span class="muted">${escapeHtml((f.error || '').slice(0, 80))}</span></span>
+      ${f.account_id
+    ? `<button class="ghost mini" data-wk-retry="${f.range}" data-wk-acc="${f.account_id}">重试</button>`
+    : '<span class="muted" style="font-size:12px">登录账号整体失败，请重新拉取</span>'}
+    </div>`).join('');
+    const allBtns = ['7', '30'].filter((k) => fails.some((f) => f.range === k && f.account_id))
+      .map((k) => `<button class="ghost mini" data-wk-retry="${k}">重试全部 ${k} 日失败账户</button>`).join('');
+    failHtml = `<div class="alertbanner" style="display:block;margin-top:12px">
+      <b>⚠ 数据不完整：${fails.length} 个账户的区间数据失败，消耗/成交合计可能偏小</b>
+      <div class="hint" style="color:#b91c1c;margin-top:6px">已自动重试仍失败，可单独重试某个账户，或按区间批量重试。</div>
+      <div style="margin-top:8px">${rows}</div>
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">${allBtns}</div>
+    </div>`;
+  }
+  $('#wkPreview').innerHTML = table + failHtml + `<div class="hint">取数口径：磁力金牛（区间导出）；周期：${escapeHtml(res.label7 || '')} / ${escapeHtml(res.label30 || '')}；采集时间 ${escapeHtml(res.collected_at || '')}</div>`;
+  document.querySelectorAll('#wkPreview [data-wk-retry]').forEach((b) => {
+    b.addEventListener('click', () => retryWeek(b.dataset.wkRetry, b.dataset.wkAcc || ''));
+  });
+}
+
+async function retryWeek(rangeKey, accountId) {
+  const body = {
+    owner: [...state.owners][0] || null,
+    start: $('#wkStart').value,
+    end: $('#wkEnd').value,
+    range_start: $('#wkRangeStart').value,
+    range_end: $('#wkRangeEnd').value,
+    range: rangeKey,
+  };
+  if (accountId) body.account_ids = [String(accountId)];
+  $('#wkLog').classList.add('show');
+  const tip = accountId ? `重试账户 ${accountId}（${rangeKey} 日）` : `重试全部 ${rangeKey} 日失败账户`;
+  wkLog(tip + '…');
+  $('#wkHint').textContent = '重试中…';
+  try {
+    const { job_id } = await api('/api/week/retry', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const onLog = (m) => wkLog(m);
+    onLog.shown = 0;
+    const res = await pollJob(job_id, onLog);
+    renderWeekPreview(res);
+    $('#wkHint').textContent = '重试完成，预览已更新';
+    $('#btnRoi').disabled = false;
+  } catch (e) {
+    wkLog('重试失败：' + e.message, true);
+    $('#wkHint').textContent = '重试失败';
+  }
 }
 
 async function runSyt() {
@@ -1922,7 +1985,7 @@ async function runSyt() {
     if (c.any) {
       const lines = [];
       if (c.week_csv && c.week_csv.exists) lines.push(`· 磁力金牛 7 日数据：${c.week_csv.mtime}`);
-      if (c.prev_csv && c.prev_csv.exists) lines.push(`· 磁力金牛 30 日历史数据：${c.prev_csv.mtime}`);
+      if (c.range_csv && c.range_csv.exists) lines.push(`· 磁力金牛 30 日数据：${c.range_csv.mtime}`);
       if (c.syt_week && c.syt_week.exists) lines.push(`· 生意通周文件：${c.syt_week.mtime}`);
       if (c.syt_range && c.syt_range.exists) lines.push(`· 生意通30日文件：${c.syt_range.mtime}`);
       reuse = window.confirm(
@@ -1935,7 +1998,7 @@ async function runSyt() {
   btn.disabled = true;
   $('#wkLog').innerHTML = '';
   $('#wkLog').classList.add('show');
-  $('#wkPreview').innerHTML = `<div class="empty">拉取中…${reuse ? '复用已有数据' : '重新导出全部数据'}，首次约 20 分钟，只补 7 天约 6 分钟</div>`;
+  $('#wkPreview').innerHTML = `<div class="empty">拉取中…${reuse ? '复用已有数据' : '按区间导出 7 日与 30 日数据'}，通常几分钟</div>`;
   $('#wkHint').textContent = '正在拉取…';
   $('#btnRoi').disabled = true;
   body.reuse = reuse;
@@ -1967,8 +2030,8 @@ function renderRoiResult(res) {
       <span class="badge ${res.saved ? 'ok' : 'err'}">${res.saved ? '已保存' : '未保存'}</span>
     </div>
     <div class="hint">新周期 ${res.new_first}-${res.new_total} 行 · 商品 ${res.items} 个</div>
-    <div class="hint">7日 花费 ${fmt(res.total_cost7)} / 成交 ${fmt(res.total_gmv7)}</div>
-    <div class="hint">30日 花费 ${fmt(res.total_cost30)} / 成交 ${fmt(res.total_gmv30)}</div>
+    <div class="hint">7日 消耗 ${fmt(res.total_cost7)} / 成交 ${fmt(res.total_gmv7)}</div>
+    <div class="hint">30日 消耗 ${fmt(res.total_cost30)} / 成交 ${fmt(res.total_gmv30)}</div>
     <div class="path">${escapeHtml(res.book || '')}</div>
     <ul class="checks">${checks}</ul>
   </div>`;

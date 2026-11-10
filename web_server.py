@@ -229,12 +229,12 @@ def _login_accounts_public(cfg: dict) -> list[dict]:
             "excel_exists": bool(p) and kx.resolve_path(p).exists(),
             "roi_book_path": roi,
             "roi_book_exists": bool(roi) and kx.resolve_path(roi).exists(),
-            "week_cost_source": str(a.get("week_cost_source") or "both"),
             "enabled": a.get("enabled", True) is not False,
             "has_password": bool(a.get("password")),
             "include_accounts": list(a.get("include_accounts") or []),
             "exclude_accounts": list(a.get("exclude_accounts") or []),
             "alert_thresholds": dict(a.get("alert_thresholds") or {}),
+            "alert_cooldown_minutes": int(a.get("alert_cooldown_minutes", 30)),
             "legacy_profile": bool(a.get("legacy_profile")),
         })
     return out
@@ -386,6 +386,7 @@ CONFIG_KEYS = ("headless", "date_offset_days", "page_size",
                "manual_login_timeout", "filter_by_excel",
                "auto_backup", "backup_limit", "version", "update_repo",
                "update_source", "update_webdav_path",
+               "update_github_mirror_enabled", "update_github_mirror",
                "realtime_auto_refresh", "realtime_interval_minutes",
                "realtime_window_start", "realtime_window_end",
                "realtime_retry_enabled", "realtime_retry_max")
@@ -437,8 +438,20 @@ def _as_ids(v) -> list[str]:
     return [str(x).strip() for x in items if str(x).strip()]
 
 
-ALERT_COOLDOWN = 1800  # 同一账户重复告警的最小间隔（秒）
+ALERT_COOLDOWN = 1800  # 默认冷却（秒）；可在「账号管理」按登录账号覆盖
 _ALERT_STATE: dict[str, tuple[bool, float]] = {}
+
+
+def _alert_cooldowns(cfg: dict) -> dict[str, int]:
+    """每个登录账号的预警冷却秒数（alert_cooldown_minutes，0 表示每次抓取都提醒）"""
+    out = {}
+    for a in cfg.get("accounts") or []:
+        try:
+            minutes = int(a.get("alert_cooldown_minutes", 30))
+        except (TypeError, ValueError):
+            minutes = 30
+        out[str(a.get("id"))] = max(0, min(minutes, 1440)) * 60
+    return out
 
 
 def _eval_alerts(cfg: dict, data: dict) -> list[dict]:
@@ -466,22 +479,25 @@ def _eval_alerts(cfg: dict, data: dict) -> list[dict]:
     return out
 
 
-def _notify_alerts(alerts: list[dict], logger=None):
-    """超线时发 Windows 气泡；同一账户 30 分钟内不重复弹"""
+def _notify_alerts(alerts: list[dict], cfg: dict, logger=None):
+    """超线时发 Windows 气泡；冷却时间按登录账号配置，同一账户冷却期内不重复弹"""
     now = time.time()
-    over_ids = {a["account_id"] for a in alerts}
-    for aid in list(_ALERT_STATE):
-        if aid not in over_ids:
-            _ALERT_STATE[aid] = (False, 0.0)
+    cooldowns = _alert_cooldowns(cfg)
+    over_keys = {f"{a.get('owner_id', '')}|{a['account_id']}" for a in alerts}
+    for key in list(_ALERT_STATE):
+        if key not in over_keys:
+            _ALERT_STATE[key] = (False, 0.0)
 
     fresh = []
     for a in alerts:
-        was, last = _ALERT_STATE.get(a["account_id"], (False, 0.0))
-        if (not was) or now - last >= ALERT_COOLDOWN:
+        key = f"{a.get('owner_id', '')}|{a['account_id']}"
+        wait = cooldowns.get(str(a.get("owner_id")), ALERT_COOLDOWN)
+        was, last = _ALERT_STATE.get(key, (False, 0.0))
+        if wait <= 0 or (not was) or now - last >= wait:
             fresh.append(a)
-            _ALERT_STATE[a["account_id"]] = (True, now)
+            _ALERT_STATE[key] = (True, now)
         else:
-            _ALERT_STATE[a["account_id"]] = (True, last)
+            _ALERT_STATE[key] = (True, last)
 
     if not fresh:
         if logger and alerts:
@@ -556,7 +572,7 @@ def collect_realtime(cfg: dict, owners: list[dict] | None = None, logger=print,
             "alerts": alerts,
         }
         kx.save_realtime_cache(combined)
-        _notify_alerts(alerts, logger=logger)
+        _notify_alerts(alerts, cfg, logger=logger)
         return combined
     finally:
         REALTIME_LOCK.release()
@@ -661,6 +677,13 @@ def api_save_config(body: dict) -> dict:
         cfg["update_source"] = src
     if "update_webdav_path" in body:
         cfg["update_webdav_path"] = str(body.get("update_webdav_path") or "/version.json").strip() or "/version.json"
+    if "update_github_mirror_enabled" in body:
+        cfg["update_github_mirror_enabled"] = bool(body["update_github_mirror_enabled"])
+    if "update_github_mirror" in body:
+        mirror = str(body.get("update_github_mirror") or "").strip()
+        if mirror and not re.match(r"^https?://", mirror, re.I):
+            raise ValueError("GitHub 镜像地址需以 http:// 或 https:// 开头")
+        cfg["update_github_mirror"] = mirror
     if "realtime_auto_refresh" in body:
         cfg["realtime_auto_refresh"] = bool(body["realtime_auto_refresh"])
     if "realtime_interval_minutes" in body:
@@ -692,7 +715,8 @@ def api_save_config(body: dict) -> dict:
     return {"ok": True, **api_config()}
 
 
-def _alert_thresholds(v) -> dict:
+def _alert_thresholds(v, with_zero: bool = False) -> dict:
+    """校验预警线；with_zero=True 时保留 0（表示取消该账户的预警线）"""
     if not isinstance(v, dict):
         raise ValueError("alert_thresholds 必须是 {账户ID: 预警线} 的对象")
     th = {}
@@ -701,15 +725,19 @@ def _alert_thresholds(v) -> dict:
         if not key.isdigit():
             raise ValueError(f"账户ID 不合法: {key}")
         if val in (None, ""):
+            if with_zero:
+                th[key] = 0.0
             continue
         try:
             num = round(float(val), 2)
         except (TypeError, ValueError):
             raise ValueError(f"账户 {key} 的预警线必须是数字")
-        if num <= 0:
-            continue
         if num > 10_000_000:
             raise ValueError(f"账户 {key} 的预警线过大")
+        if num <= 0:
+            if with_zero:
+                th[key] = 0.0
+            continue
         th[key] = num
     return th
 
@@ -731,11 +759,11 @@ def api_save_login_account(body: dict) -> dict:
             "login_role": "auto",
             "excel_path": "",
             "roi_book_path": "",
-            "week_cost_source": "both",
             "enabled": True,
             "include_accounts": [],
             "exclude_accounts": [],
             "alert_thresholds": {},
+            "alert_cooldown_minutes": 30,
             "legacy_profile": False,
         }
         accounts.append(cur)
@@ -768,11 +796,6 @@ def api_save_login_account(body: dict) -> dict:
         if p and Path(p).suffix.lower() not in EXCEL_SUFFIXES:
             raise ValueError("核算表仅支持 .xlsx / .xlsm 格式")
         cur["roi_book_path"] = p
-    if "week_cost_source" in body:
-        src = str(body.get("week_cost_source") or "both").strip().lower()
-        if src not in ("month", "niu", "both"):
-            raise ValueError("周数据取数维度只能是 month / niu / both")
-        cur["week_cost_source"] = src
     if "enabled" in body:
         cur["enabled"] = bool(body["enabled"])
     if "include_accounts" in body:
@@ -780,7 +803,18 @@ def api_save_login_account(body: dict) -> dict:
     if "exclude_accounts" in body:
         cur["exclude_accounts"] = _as_ids(body["exclude_accounts"])
     if "alert_thresholds" in body:
-        cur["alert_thresholds"] = _alert_thresholds(body.get("alert_thresholds") or {})
+        # 增量合并：本次提交的账户覆盖或删除（0 = 删除），未提交的账户保持原配置
+        patch = _alert_thresholds(body.get("alert_thresholds") or {}, with_zero=True)
+        merged = dict(cur.get("alert_thresholds") or {})
+        for aid, val in patch.items():
+            if val > 0:
+                merged[aid] = val
+            else:
+                merged.pop(aid, None)
+        cur["alert_thresholds"] = merged
+    if "alert_cooldown_minutes" in body:
+        cur["alert_cooldown_minutes"] = _as_int(
+            body["alert_cooldown_minutes"], "预警冷却时间（分钟）", 0, 1440)
 
     if not str(cur.get("login_account") or "").strip() and not str(cur.get("excel_path") or "").strip():
         raise ValueError("请至少填写登录手机号或月度表路径")
@@ -881,6 +915,32 @@ def api_week_collect(body: dict, logger=print) -> dict:
     logger(f"[week] 使用账号「{acct.get('label') or acct.get('id')}」")
     return week_data.collect(ecfg, start, end, rs, re_,
                              reuse=bool(body.get("reuse", True)), logger=logger)
+
+
+def api_week_retry(body: dict, logger=print) -> dict:
+    """手动重试某个区间里失败的账户，然后重新生成预览（复用已导出数据）"""
+    start = str(body.get("start") or "").strip()
+    end = str(body.get("end") or "").strip()
+    rs = str(body.get("range_start") or "").strip()
+    re_ = str(body.get("range_end") or "").strip()
+    if not all((start, end, rs, re_)):
+        raise ValueError("缺少日期参数（start/end/range_start/range_end）")
+    range_key = str(body.get("range") or "").strip()
+    if range_key not in ("7", "30"):
+        raise ValueError("range 只能是 7 或 30")
+    cfg = _config_snapshot()
+    acct = _pick_owner(cfg, str(body.get("owner") or "").strip() or None)
+    ecfg = kx.account_cfg(cfg, acct)
+    ids = [str(x).strip() for x in (body.get("account_ids") or []) if str(x).strip()]
+    if not ids:
+        pv = week_data.load_preview(start, end) or {}
+        ids = sorted({str(f.get("account_id")) for f in (pv.get("failures") or [])
+                      if str(f.get("range")) == range_key and f.get("account_id")})
+    if not ids:
+        raise ValueError(f"{range_key} 日没有失败账户需要重试")
+    logger(f"[week] 重试 {range_key} 日失败账户：{','.join(ids)}")
+    week_data.retry(ecfg, start, end, rs, re_, range_key, ids, logger=logger)
+    return week_data.collect(ecfg, start, end, rs, re_, reuse=True, logger=logger)
 
 
 def api_roi_merge(body: dict, logger=print) -> dict:
@@ -1243,6 +1303,85 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _mirror_url(cfg: dict, url: str) -> str:
+    """GitHub 升级包下载地址拼接镜像前缀（仅勾选镜像且地址非空时生效）"""
+    if not cfg.get("update_github_mirror_enabled"):
+        return url
+    base = str(cfg.get("update_github_mirror") or "").strip()
+    if not base:
+        return url
+    if not re.match(r"^https?://", base, re.I):
+        raise ValueError("GitHub 镜像地址需以 http:// 或 https:// 开头")
+    return base.rstrip("/") + "/" + url
+
+
+SPEEDTEST_SECONDS = 8.0
+SPEEDTEST_BYTES = 12 * 1024 * 1024
+
+
+def _speed_probe(url: str, label: str) -> dict:
+    """限时/限量取样测速（Range 不保证生效，读够即断开）"""
+    headers = {"User-Agent": "kuaishou-roi-workbench",
+               "Range": f"bytes=0-{SPEEDTEST_BYTES - 1}"}
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["Accept"] = "application/octet-stream"
+    started = time.time()
+    with urllib.request.urlopen(
+            urllib.request.Request(url, headers=headers), timeout=20) as resp:
+        ttfb = time.time() - started
+        ctype = str(resp.headers.get("Content-Type") or "").lower()
+        if "text/html" in ctype:
+            raise RuntimeError("返回的是网页而不是安装包（镜像地址可能失效）")
+        done = 0
+        while done < SPEEDTEST_BYTES and time.time() - started < SPEEDTEST_SECONDS:
+            chunk = resp.read(64 * 1024)
+            if not chunk:
+                break
+            done += len(chunk)
+    elapsed = max(0.001, time.time() - started)
+    return {
+        "ok": True,
+        "label": label,
+        "url": url,
+        "bytes": done,
+        "seconds": round(elapsed, 2),
+        "ttfb": round(ttfb, 2),
+        "speed_mbps": round(done / elapsed / 1024 / 1024, 2),
+        "sampled": done < SPEEDTEST_BYTES,
+    }
+
+
+def api_update_speedtest() -> dict:
+    """分别测 GitHub 直连与镜像的下载速度（取最新 Release 安装包取样）"""
+    with CFG_LOCK:
+        cfg = dict(CFG)
+    if str(cfg.get("update_source") or "github").strip().lower() != "github":
+        raise RuntimeError("测速仅支持 GitHub 更新源")
+    mirror = str(cfg.get("update_github_mirror") or "").strip()
+    if not mirror:
+        raise RuntimeError("未配置 GitHub 镜像地址，请先在设置中填写")
+    info = _update_info(cfg)
+    asset = info.get("asset") or {}
+    url = str(asset.get("url") or "")
+    if not url:
+        raise RuntimeError("没有找到可测速的 Release 安装包")
+    targets = [("direct", url), ("mirror", _mirror_url({**cfg, "update_github_mirror_enabled": True}, url))]
+    results = {}
+    for label, target in targets:
+        print(f"[update] 测速 {label}: {target}")
+        try:
+            results[label] = _speed_probe(target, label)
+            print(f"[update] 测速 {label} 完成: {results[label]['speed_mbps']} MB/s"
+                  f"（{results[label]['seconds']}s，首字节 {results[label]['ttfb']}s）")
+        except Exception as e:  # noqa: BLE001
+            results[label] = {"ok": False, "label": label, "url": target,
+                              "error": f"{type(e).__name__}: {e}"}
+            print(f"[update] 测速 {label} 失败: {type(e).__name__}: {e}")
+    return {"asset": asset.get("name"), "size": asset.get("size"), "results": results}
+
+
 def _download(cfg: dict, url: str, dst: Path, logger, on_progress=None, total_hint=None) -> dict:
     """下载升级包；on_progress 回调带 downloaded/total/speed/percent（用于网页进度条）"""
     logger("[update] 开始下载升级包…")
@@ -1254,6 +1393,10 @@ def _download(cfg: dict, url: str, dst: Path, logger, on_progress=None, total_hi
                                      headers={"User-Agent": "kuaishou-roi-workbench"})
         resp = opener.open(req, timeout=120)
     else:
+        direct_url = url
+        url = _mirror_url(cfg, url)
+        if url != direct_url:
+            logger(f"[update] 使用 GitHub 镜像下载：{url}")
         token = os.environ.get("GITHUB_TOKEN", "").strip()
         req = urllib.request.Request(url, headers={"User-Agent": "kuaishou-roi-workbench"})
         if token:
@@ -1862,6 +2005,12 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:  # noqa: BLE001
                     print(f"[web] 检查更新失败: {type(e).__name__}: {e}")
                     return self._json({"error": str(e)}, 502)
+            if u.path == "/api/update/speedtest":
+                try:
+                    return self._json(api_update_speedtest())
+                except Exception as e:  # noqa: BLE001
+                    print(f"[web] 测速失败: {type(e).__name__}: {e}")
+                    return self._json({"error": str(e)}, 502)
             if u.path == "/api/job":
                 jid = q.get("id", "")
                 with JOBS_LOCK:
@@ -2158,6 +2307,21 @@ class Handler(BaseHTTPRequestHandler):
                         _job_done(jid, error=f"{type(e).__name__}: {e}")
 
                 threading.Thread(target=work_week, daemon=True).start()
+                return self._json({"job_id": jid})
+
+            if u.path == "/api/week/retry":
+                body = self._body()
+                jid = _job_new("week")
+
+                def work_week_retry():
+                    try:
+                        res = api_week_retry(body, logger=lambda m: _job_log(jid, m))
+                        _job_done(jid, res)
+                    except Exception as e:  # noqa: BLE001
+                        _job_log(jid, f"[week] 重试失败: {type(e).__name__}: {e}")
+                        _job_done(jid, error=f"{type(e).__name__}: {e}")
+
+                threading.Thread(target=work_week_retry, daemon=True).start()
                 return self._json({"job_id": jid})
 
             if u.path == "/api/roi/merge":

@@ -21,7 +21,7 @@ import shutil
 import sys
 from collections import defaultdict
 from copy import copy
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -163,13 +163,12 @@ def _prune_backups(bdir: Path, stem: str, suffix: str, limit: int, logger) -> No
 
 def run_merge(cfg: dict, start: str, end: str, range_start: str, range_end: str,
               book_path: Path | None = None, week_csv: Path | None = None,
-              prev_csv: Path | None = None, syt_week: Path | None = None,
+              range_csv: Path | None = None, syt_week: Path | None = None,
               syt_range: Path | None = None, items: list[dict] | None = None,
               backup: bool = True, save: bool = True, overwrite: bool = False,
               logger=log_default) -> dict:
     d_start, d_end = _parse(start), _parse(end)
     d_rs, d_re = _parse(range_start), _parse(range_end)
-    prev_end = d_start - timedelta(days=1)
 
     book = Path(book_path) if book_path else None
     if book is None:
@@ -179,8 +178,8 @@ def run_merge(cfg: dict, start: str, end: str, range_start: str, range_end: str,
         book = kx.resolve_path(raw)
 
     week_csv = Path(week_csv) if week_csv else (kx.DATA_DIR / "exports" / f"{start}_{end}" / "products.csv")
-    prev_csv = Path(prev_csv) if prev_csv else (
-        kx.DATA_DIR / "exports" / f"{range_start}_{prev_end.isoformat()}" / "products.csv")
+    range_csv = Path(range_csv) if range_csv else (
+        kx.DATA_DIR / "exports" / f"{range_start}_{range_end}" / "products.csv")
     syt_dir = kx.DATA_DIR / "syt"
 
     if syt_week is None or syt_range is None:
@@ -195,7 +194,7 @@ def run_merge(cfg: dict, start: str, end: str, range_start: str, range_end: str,
     if not book or not Path(book).exists():
         raise FileNotFoundError(f"核算表不存在: {book}")
     if not items:
-        for label, p in (("本周 products.csv", week_csv), ("上期 products.csv", prev_csv),
+        for label, p in (("本周 products.csv", week_csv), ("30日 products.csv", range_csv),
                          ("生意通周文件", syt_week), ("生意通30日文件", syt_range)):
             if p is None or not Path(p).exists():
                 raise FileNotFoundError(f"{label} 不存在: {p}")
@@ -233,9 +232,9 @@ def run_merge(cfg: dict, start: str, end: str, range_start: str, range_end: str,
         range_rate = {str(it["product_id"]): float(it["rate30"]) for it in items}
     else:
         week = read_products(week_csv)
-        prev = read_products(prev_csv)
-        thirty = {pid: [week.get(pid, [0.0, 0.0])[0] + prev.get(pid, [0.0, 0.0])[0],
-                        week.get(pid, [0.0, 0.0])[1] + prev.get(pid, [0.0, 0.0])[1]]
+        # 30 日 CSV 覆盖整个区间（含 7 日窗口），直接汇总即可，不能再加周数据
+        range_prod = read_products(range_csv)
+        thirty = {pid: list(range_prod.get(pid, [0.0, 0.0]))
                   for pid, _n in products}
         targets = {pid for pid, _n in products}
         week_rate = read_syt_rates(syt_week, targets)
@@ -412,7 +411,7 @@ def run_merge(cfg: dict, start: str, end: str, range_start: str, range_end: str,
         "saved": saved,
         "overwritten": bool(dup),
         "files": {"week_csv": str(week_csv) if week_csv else "",
-                  "prev_csv": str(prev_csv) if prev_csv else "",
+                  "range_csv": str(range_csv) if range_csv else "",
                   "syt_week": str(syt_week) if syt_week else "",
                   "syt_range": str(syt_range) if syt_range else ""},
     }
