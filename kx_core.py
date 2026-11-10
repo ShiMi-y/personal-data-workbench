@@ -38,7 +38,7 @@ else:
     BUNDLE_DIR = BASE
 
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 PROFILE_DIR = BASE / ".browser_profile"
 PROFILES_DIR = BASE / ".browser_profiles"
 DATA_DIR = BASE / "data"
@@ -156,6 +156,7 @@ def load_config(path: Path | None = None) -> dict:
     cfg.setdefault("update_webdav_path", "/version.json")
     cfg.setdefault("update_github_mirror_enabled", False)
     cfg.setdefault("update_github_mirror", "https://ghproxy.net/")
+    cfg.setdefault("update_proxy", "")
     cfg.setdefault("realtime_auto_refresh", False)
     cfg.setdefault("realtime_interval_minutes", 5)
     cfg.setdefault("realtime_window_start", "08:50")

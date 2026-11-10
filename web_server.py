@@ -190,7 +190,7 @@ def api_state() -> dict:
         "webdav_private_legacy": private["legacy"],
         "webdav_private_unlocked": private["unlocked"],
         "alert_thresholds": thresholds,
-        "has_github_token": bool(os.environ.get("GITHUB_TOKEN", "").strip()),
+        "has_github_token": bool(_github_token()),
         "realtime": _tag_legacy_realtime(kx.load_realtime_cache(), cfg),
         "headless": bool(cfg.get("headless", True)),
         "has_credentials": any(a.get("has_password") for a in login_accounts),
@@ -386,7 +386,7 @@ CONFIG_KEYS = ("headless", "date_offset_days", "page_size",
                "manual_login_timeout", "filter_by_excel",
                "auto_backup", "backup_limit", "version", "update_repo",
                "update_source", "update_webdav_path",
-               "update_github_mirror_enabled", "update_github_mirror",
+               "update_github_mirror_enabled", "update_github_mirror", "update_proxy",
                "realtime_auto_refresh", "realtime_interval_minutes",
                "realtime_window_start", "realtime_window_end",
                "realtime_retry_enabled", "realtime_retry_max")
@@ -684,6 +684,11 @@ def api_save_config(body: dict) -> dict:
         if mirror and not re.match(r"^https?://", mirror, re.I):
             raise ValueError("GitHub 镜像地址需以 http:// 或 https:// 开头")
         cfg["update_github_mirror"] = mirror
+    if "update_proxy" in body:
+        proxy = str(body.get("update_proxy") or "").strip()
+        if proxy and not re.match(r"^https?://", proxy, re.I):
+            raise ValueError("代理地址需以 http:// 或 https:// 开头（如 http://127.0.0.1:7897）")
+        cfg["update_proxy"] = proxy
     if "realtime_auto_refresh" in body:
         cfg["realtime_auto_refresh"] = bool(body["realtime_auto_refresh"])
     if "realtime_interval_minutes" in body:
@@ -1126,6 +1131,11 @@ def _ver_tuple(v) -> tuple:
     return tuple(int(n) for n in nums[:6]) or (0,)
 
 
+def _github_token() -> str:
+    """GitHub 访问令牌：优先 GITHUB_TOKEN，兼容 GH_TOKEN"""
+    return (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+
+
 def _github_release(cfg: dict) -> dict:
     """取 GitHub 最新 Release（私有仓库可用环境变量 GITHUB_TOKEN）"""
     repo = str(cfg.get("update_repo") or "").strip().strip("/")
@@ -1135,10 +1145,10 @@ def _github_release(cfg: dict) -> dict:
         f"https://api.github.com/repos/{repo}/releases/latest",
         headers={"Accept": "application/vnd.github+json", "User-Agent": "kuaishou-roi-workbench"},
     )
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    token = _github_token()
     if token:
         req.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(req, timeout=20) as r:
+    with _update_opener(cfg).open(req, timeout=20) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -1319,16 +1329,27 @@ SPEEDTEST_SECONDS = 8.0
 SPEEDTEST_BYTES = 12 * 1024 * 1024
 
 
-def _speed_probe(url: str, label: str) -> dict:
+def _update_opener(cfg: dict):
+    """升级相关请求的 opener：配置了代理就走代理，留空则沿用系统环境变量"""
+    proxy = str(cfg.get("update_proxy") or "").strip()
+    if not proxy:
+        return urllib.request.build_opener()
+    if not re.match(r"^https?://", proxy, re.I):
+        raise ValueError("代理地址需以 http:// 或 https:// 开头")
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+
+
+def _speed_probe(url: str, label: str, proxy: str = "") -> dict:
     """限时/限量取样测速（Range 不保证生效，读够即断开）"""
     headers = {"User-Agent": "kuaishou-roi-workbench",
                "Range": f"bytes=0-{SPEEDTEST_BYTES - 1}"}
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    token = _github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
         headers["Accept"] = "application/octet-stream"
     started = time.time()
-    with urllib.request.urlopen(
+    with _update_opener({"update_proxy": proxy}).open(
             urllib.request.Request(url, headers=headers), timeout=20) as resp:
         ttfb = time.time() - started
         ctype = str(resp.headers.get("Content-Type") or "").lower()
@@ -1340,6 +1361,8 @@ def _speed_probe(url: str, label: str) -> dict:
             if not chunk:
                 break
             done += len(chunk)
+    if done <= 0:
+        raise RuntimeError("连接建立但未收到数据（可能被网络阻断，请重试或改用镜像）")
     elapsed = max(0.001, time.time() - started)
     return {
         "ok": True,
@@ -1370,15 +1393,24 @@ def api_update_speedtest() -> dict:
     targets = [("direct", url), ("mirror", _mirror_url({**cfg, "update_github_mirror_enabled": True}, url))]
     results = {}
     for label, target in targets:
-        print(f"[update] 测速 {label}: {target}")
-        try:
-            results[label] = _speed_probe(target, label)
-            print(f"[update] 测速 {label} 完成: {results[label]['speed_mbps']} MB/s"
-                  f"（{results[label]['seconds']}s，首字节 {results[label]['ttfb']}s）")
-        except Exception as e:  # noqa: BLE001
+        attempts = 2 if label == "direct" else 1  # 直连偶发超时，多试一次
+        last_err = None
+        for attempt in range(attempts):
+            print(f"[update] 测速 {label}（{attempt + 1}/{attempts}）: {target}")
+            try:
+                results[label] = _speed_probe(target, label, str(cfg.get("update_proxy") or ""))
+                print(f"[update] 测速 {label} 完成: {results[label]['speed_mbps']} MB/s"
+                      f"（{results[label]['seconds']}s，首字节 {results[label]['ttfb']}s）")
+                last_err = None
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                print(f"[update] 测速 {label} 失败（{attempt + 1}/{attempts}）: {type(e).__name__}: {e}")
+                if attempt + 1 < attempts:
+                    time.sleep(1.0)
+        if last_err is not None:
             results[label] = {"ok": False, "label": label, "url": target,
-                              "error": f"{type(e).__name__}: {e}"}
-            print(f"[update] 测速 {label} 失败: {type(e).__name__}: {e}")
+                              "error": f"{type(last_err).__name__}: {last_err}"}
     return {"asset": asset.get("name"), "size": asset.get("size"), "results": results}
 
 
@@ -1397,12 +1429,12 @@ def _download(cfg: dict, url: str, dst: Path, logger, on_progress=None, total_hi
         url = _mirror_url(cfg, url)
         if url != direct_url:
             logger(f"[update] 使用 GitHub 镜像下载：{url}")
-        token = os.environ.get("GITHUB_TOKEN", "").strip()
+        token = _github_token()
         req = urllib.request.Request(url, headers={"User-Agent": "kuaishou-roi-workbench"})
         if token:
             req.add_header("Authorization", f"Bearer {token}")
             req.add_header("Accept", "application/octet-stream")
-        resp = urllib.request.urlopen(req, timeout=120)
+        resp = _update_opener(cfg).open(req, timeout=120)
 
     def emit(**kw):
         if on_progress:
@@ -1651,11 +1683,24 @@ if (-not $NoGui) {
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedSingle'
     $form.MaximizeBox = $false
-    $form.MinimizeBox = $false
-    $form.ControlBox = $false
+    $form.MinimizeBox = $true
+    $form.ControlBox = $true
+    $form.ShowInTaskbar = $true
     $form.TopMost = $true
     $form.BackColor = [System.Drawing.Color]::FromArgb(245, 246, 248)
     $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+
+    # 允许最小化，但不允许中途关闭（关闭会中断替换）
+    $script:allowClose = $false
+    $form.add_FormClosing({
+      param($sender, $e)
+      if (-not $script:allowClose) {
+        $e.Cancel = $true
+        [void][System.Windows.Forms.MessageBox]::Show(
+          '升级正在进行，请等待完成。如需暂时收起窗口，请点右上角最小化按钮。',
+          '升级中', 'OK', 'Information')
+      }
+    })
 
     $lblTitle = New-Object System.Windows.Forms.Label
     $lblTitle.Text = '正在升级快手数据工作台'
@@ -1785,7 +1830,7 @@ try {
 }
 
 Start-Sleep -Seconds 2
-if ($null -ne $form) { try { $form.Close() } catch { } }
+if ($null -ne $form) { try { $script:allowClose = $true; $form.Close() } catch { } }
 exit 0
 """
 

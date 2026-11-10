@@ -471,7 +471,10 @@
         <div class="field wide" id="ghUpdateBox">
           <label>GitHub 仓库 update_repo（owner/repo）</label>
           <input type="text" id="cfgUpdateRepo" placeholder="your-name/personal-data-workbench" />
-          <span class="hint" style="margin-top:4px">必填，格式 owner/repo（如 ShiMi-y/personal-data-workbench）；私有仓库需在系统环境变量里设置 GITHUB_TOKEN</span>
+          <span class="hint" style="margin-top:4px">必填，格式 owner/repo（如 ShiMi-y/personal-data-workbench）；私有仓库需在系统环境变量里设置 GITHUB_TOKEN（兼容 GH_TOKEN）</span>
+          <label style="margin-top:10px">升级下载代理（可选，留空直连）</label>
+          <input type="text" id="cfgUpdateProxy" placeholder="http://127.0.0.1:7897" />
+          <span class="hint" style="margin-top:4px">用于检查更新、测速和下载升级包；留空则直连（或沿用系统代理环境变量）。</span>
           <label class="switchline" style="margin-top:10px"><input type="checkbox" id="cfgGhMirror" /> 升级包下载使用 GitHub 镜像</label>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:7px;align-items:center">
             <input type="text" id="cfgGhMirrorUrl" placeholder="https://ghproxy.net/" style="flex:1;min-width:240px" />
@@ -627,6 +630,7 @@ async function loadConfig() {
     $('#cfgUpdateRepo').value = c.update_repo || '';
     $('#cfgGhMirror').checked = !!c.update_github_mirror_enabled;
     $('#cfgGhMirrorUrl').value = c.update_github_mirror || 'https://ghproxy.net/';
+    $('#cfgUpdateProxy').value = c.update_proxy || '';
     $('#cfgDavUrl').value = c.webdav_url || '';
     $('#cfgDavUser').value = c.webdav_username || '';
     $('#cfgDavPass').value = '';
@@ -678,6 +682,7 @@ async function saveConfig() {
     update_source: $('#cfgUpdateSource').value,
     update_github_mirror_enabled: $('#cfgGhMirror').checked,
     update_github_mirror: $('#cfgGhMirrorUrl').value.trim(),
+    update_proxy: $('#cfgUpdateProxy').value.trim(),
     update_webdav_path: $('#cfgDavPath').value.trim(),
     auto_backup: $('#cfgAutoBackup').checked,
     backup_limit: Number($('#cfgBackupLimit').value),
