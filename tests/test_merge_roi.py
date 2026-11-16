@@ -214,6 +214,34 @@ class MergeRoiTests(RoiTestBase):
         self.assertEqual(wb["退款率"].max_column, 14)  # 不再插列
         wb.close()
 
+    def test_append_more_products_than_previous_period(self):
+        """商品清单变多（9 → 14）时，盈利块按实际数量写入，退款率页同步补齐"""
+        self.prepare()
+        extra = [(f"99999999{i:04d}", f"新商品{i}") for i in range(5)]
+        wb = load_workbook(self.book)
+        ws_rate = wb["退款率"]
+        for i, (pid, name) in enumerate(extra):
+            ws_rate.cell(row=11 + i, column=1, value=pid)
+            ws_rate.cell(row=11 + i, column=2, value=name)
+        wb.save(self.book)
+        wb.close()
+        items = [{"product_id": pid, "product_name": name,
+                  "cost7": 1.0, "gmv7": 2.0, "cost30": 3.0, "gmv30": 6.0,
+                  "rate7": 0.1, "rate30": 0.2}
+                 for pid, name in PIDS + extra]
+        res = self.run_it(items=items)
+        self.assertTrue(res["saved"], [c for c in res["checks"] if not c["ok"]])
+        self.assertEqual(res["items"], 14)
+        self.assertEqual((res["new_first"], res["new_total"]), (12, 26))
+        wb = load_workbook(self.book)
+        ws_rate, ws_profit = wb["退款率"], wb["盈利"]
+        self.assertEqual(ws_profit["C26"].value, "总计")
+        self.assertEqual(ws_profit["D26"].value, "=SUM(D12:D25)")
+        self.assertEqual(ws_rate["A15"].value, "999999990004")
+        self.assertEqual(ws_rate["G15"].value, "=盈利!E25")
+        self.assertEqual(ws_rate["H15"].value, 0.1)
+        wb.close()
+
     def test_missing_book_path_raises(self):
         self.cfg["roi_book_path"] = ""
         self.build_book()

@@ -82,7 +82,7 @@ def _syt_range(p: Path) -> tuple[date, date] | None:
 
 
 def _read_items(cfg: dict) -> list[tuple[str, str]]:
-    """从核算表最后一块读商品顺序"""
+    """从核算表「退款率」页读商品清单（与「1」页逐行对应，数量不固定）"""
     raw = str(cfg.get("roi_book_path") or "").strip()
     if not raw:
         raise RuntimeError("未配置核算表路径 roi_book_path")
@@ -91,16 +91,15 @@ def _read_items(cfg: dict) -> list[tuple[str, str]]:
         raise FileNotFoundError(f"核算表不存在: {book}")
     wb = load_workbook(book)
     try:
-        ws = wb[merge_roi.SHEET_PROFIT]
-        blocks = merge_roi.detect_periods(ws)
-        if not blocks:
-            raise RuntimeError("盈利表未识别到周期块")
-        last = blocks[-1]
+        ws = wb[merge_roi.SHEET_RATE]
         out = []
-        for i in range(merge_roi.ITEMS_PER_PERIOD):
-            r = last["first"] + i
-            out.append((merge_roi._cell_id(ws.cell(row=r, column=2).value),
-                        str(ws.cell(row=r, column=3).value or "").strip()))
+        for r in range(2, int(ws.max_row or 0) + 1):
+            pid = merge_roi._cell_id(ws.cell(row=r, column=1).value)
+            if not pid:
+                continue
+            out.append((pid, str(ws.cell(row=r, column=2).value or "").strip()))
+        if not out:
+            raise RuntimeError("退款率表没有商品行，请先在核算表里维护商品清单")
         return out
     finally:
         wb.close()

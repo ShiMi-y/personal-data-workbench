@@ -2,7 +2,7 @@
 """退款率 / 盈利 两张表的周期追加
 
 做的事：
-  1. 「盈利」表末尾追加一个新周期（9 个商品 + 总计行）
+  1. 「盈利」表末尾追加一个新周期（商品清单个商品 + 总计行）
      7 日块 A:H，30 日块 J:Q，公式沿用上一周期
   2. 「退款率」表在 G 列前插入 4 列（新块占 G:J，旧块整体右移）
      G/I 引用盈利表新周期，H/J 填生意通退款率
@@ -33,7 +33,6 @@ SHEET_RATE = "退款率"
 SHEET_PROFIT = "盈利"
 GROUP_WIDTH = 4          # 退款率表每周期 4 列
 INSERT_AT = 7            # 插在 G 列之前
-ITEMS_PER_PERIOD = 9     # 每个周期 9 个商品
 
 
 def log_default(msg: str) -> None:
@@ -68,9 +67,9 @@ def _copy_style(dst, src) -> None:
 
 
 def detect_periods(ws) -> list[dict]:
-    """盈利表：按 A 列连续相同值切周期块"""
+    """盈利表：按 A 列连续相同值切周期块（块尾取最后一个非空 A 行，跳过中间空行）"""
     blocks: list[dict] = []
-    cur, start = None, None
+    cur, start, last_r = None, None, None
     for r in range(1, int(ws.max_row or 0) + 1):
         v = ws.cell(row=r, column=1).value
         s = str(v).strip() if v is not None else ""
@@ -79,10 +78,11 @@ def detect_periods(ws) -> list[dict]:
         if cur is None:
             cur, start = s, r
         elif s != cur:
-            blocks.append({"label": cur, "first": start, "total": r - 1})
+            blocks.append({"label": cur, "first": start, "total": last_r})
             cur, start = s, r
+        last_r = r
     if cur is not None:
-        blocks.append({"label": cur, "first": start, "total": int(ws.max_row or 0)})
+        blocks.append({"label": cur, "first": start, "total": last_r})
     return blocks
 
 
@@ -210,20 +210,21 @@ def run_merge(cfg: dict, start: str, end: str, range_start: str, range_end: str,
     last = blocks[-1]
     if str(ws_profit.cell(row=last["total"], column=3).value or "").strip() != "总计":
         raise RuntimeError(f"盈利表最后一块 {last['first']}-{last['total']} 末行不是总计行")
-    if last["total"] - last["first"] != ITEMS_PER_PERIOD:
-        raise RuntimeError(f"最后一块行数异常：{last['first']}-{last['total']}")
 
     if items:
         products = [(str(it.get("product_id") or ""), str(it.get("product_name") or ""))
                     for it in items]
     else:
+        # 商品清单以「退款率」页为准（与「1」页逐行对应），不再限制 9 个
         products = []
-        for i in range(ITEMS_PER_PERIOD):
-            r = last["first"] + i
-            products.append((_cell_id(ws_profit.cell(row=r, column=2).value),
-                             str(ws_profit.cell(row=r, column=3).value or "").strip()))
-    if len(products) != ITEMS_PER_PERIOD or any(not pid for pid, _n in products):
-        raise RuntimeError("商品顺序异常，无法确定 9 个商品")
+        for r in range(2, int(ws_rate.max_row or 0) + 1):
+            pid = _cell_id(ws_rate.cell(row=r, column=1).value)
+            if not pid:
+                continue
+            products.append((pid, str(ws_rate.cell(row=r, column=2).value or "").strip()))
+    if not products or any(not pid for pid, _n in products):
+        raise RuntimeError("退款率表商品清单为空或存在空商品ID，无法写入")
+    n_items = len(products)
 
     if items:
         week = {str(it["product_id"]): [float(it["cost7"]), float(it["gmv7"])] for it in items}
@@ -272,14 +273,21 @@ def run_merge(cfg: dict, start: str, end: str, range_start: str, range_end: str,
     # ---------------- 盈利表：追加或覆盖周期 ----------------
     if dup:
         new_first = dup[-1]["first"]
-        new_total = dup[-1]["total"]
-        logger(f"[roi] 覆盖已有周期 {new_first}-{new_total} 行")
+        old_n = dup[-1]["total"] - new_first
+        if n_items > old_n:
+            ws_profit.insert_rows(new_first + old_n, n_items - old_n)
+        elif n_items < old_n:
+            ws_profit.delete_rows(new_first + n_items, old_n - n_items)
+        new_total = new_first + n_items
+        logger(f"[roi] 覆盖已有周期 {new_first}-{new_total} 行（商品 {n_items} 个）")
     else:
         new_first = last["total"] + 1
-        new_total = new_first + ITEMS_PER_PERIOD
+        new_total = new_first + n_items
+    style_base = last["first"]
+    style_n = max(last["total"] - last["first"], 1)
     for i, (pid, name) in enumerate(products):
         r = new_first + i
-        ref = last["first"] + i
+        ref = style_base + (i % style_n)
         w = week.get(pid, [0.0, 0.0])
         t = thirty[pid]
         vals = {
@@ -297,15 +305,15 @@ def run_merge(cfg: dict, start: str, end: str, range_start: str, range_end: str,
 
     tot = {
         1: label7, 3: "总计",
-        4: f"=SUM(D{new_first}:D{new_first + ITEMS_PER_PERIOD - 1})",
-        5: f"=SUM(E{new_first}:E{new_first + ITEMS_PER_PERIOD - 1})",
+        4: f"=SUM(D{new_first}:D{new_first + n_items - 1})",
+        5: f"=SUM(E{new_first}:E{new_first + n_items - 1})",
         7: f"=E{new_total}/D{new_total}",
-        8: f"=SUM(H{new_first}:H{new_first + ITEMS_PER_PERIOD - 1})",
+        8: f"=SUM(H{new_first}:H{new_first + n_items - 1})",
         10: label30, 12: "总计",
-        13: f"=SUM(M{new_first}:M{new_first + ITEMS_PER_PERIOD - 1})",
-        14: f"=SUM(N{new_first}:N{new_first + ITEMS_PER_PERIOD - 1})",
+        13: f"=SUM(M{new_first}:M{new_first + n_items - 1})",
+        14: f"=SUM(N{new_first}:N{new_first + n_items - 1})",
         16: f"=N{new_total}/M{new_total}",
-        17: f"=SUM(Q{new_first}:Q{new_first + ITEMS_PER_PERIOD - 1})",
+        17: f"=SUM(Q{new_first}:Q{new_first + n_items - 1})",
     }
     for c in range(1, 18):
         cell = ws_profit.cell(row=new_total, column=c)
@@ -317,11 +325,13 @@ def run_merge(cfg: dict, start: str, end: str, range_start: str, range_end: str,
     fixed = []
     prev_block = blocks[-2] if (dup and len(blocks) >= 2) else last
     sum_re = re.compile(r"^=SUM\(([A-Z]+)(\d+):([A-Z]+)(\d+)\)$")
+    prev_sums = 0
     for c in range(1, int(ws_profit.max_column or 0) + 1):
         cell = ws_profit.cell(row=prev_block["total"], column=c)
         m = sum_re.match(str(cell.value or ""))
         if not m:
             continue
+        prev_sums += 1
         col = m.group(1)
         cell.value = f"=SUM({col}{prev_block['first']}:{col}{prev_block['total'] - 1})"
         fixed.append(f"{col}{prev_block['total']}")
@@ -366,12 +376,13 @@ def run_merge(cfg: dict, start: str, end: str, range_start: str, range_end: str,
     def add(name, ok, detail=""):
         checks.append({"name": name, "ok": bool(ok), "detail": detail})
 
-    add("盈利表新周期行数", new_total - new_first + 1 == ITEMS_PER_PERIOD + 1,
+    add("盈利表新周期行数", new_total - new_first + 1 == n_items + 1,
         f"{new_first}-{new_total}")
-    add("盈利表总计行 SUM 覆盖 9 行",
+    add(f"盈利表总计行 SUM 覆盖 {n_items} 行",
         all(str(ws_profit.cell(row=new_total, column=c).value or "").startswith(
             f"=SUM({get_column_letter(c)}{new_first}") for c in (4, 5, 8, 13, 14, 17)))
-    add("上一周期总计行已修", bool(fixed), ", ".join(fixed))
+    add("上一周期总计行已修", True,
+        ", ".join(fixed) if prev_sums else "上一周期总计为数值，无公式可修")
     expect_cols = last_col if rate_exists else last_col + GROUP_WIDTH
     add("退款率表列数正确", int(ws_rate.max_column or 0) == expect_cols,
         f"{last_col} -> {ws_rate.max_column}")

@@ -759,9 +759,12 @@ async function saveDav() {
 }
 
 function privateHintText(c) {
-  if (!c || !c.webdav_private_ready) return '未找到 webdav_private.dat';
-  if (c.webdav_private_legacy) return '旧版 DPAPI 文件：仅本机可用，建议重新生成';
-  if (c.webdav_private_unlocked) return '已就绪：口令已解锁（仅保存在内存）';
+  const ready = c && (c.webdav_private_ready ?? c.private_ready);
+  const legacy = c && (c.webdav_private_legacy ?? c.private_legacy);
+  const unlocked = c && (c.webdav_private_unlocked ?? c.private_unlocked);
+  if (!ready) return '未找到 webdav_private.dat';
+  if (legacy) return '旧版 DPAPI 文件：仅本机可用，建议重新生成';
+  if (unlocked) return '已就绪：口令已解锁（仅保存在内存）';
   return '已就绪：需要输入口令解锁';
 }
 
