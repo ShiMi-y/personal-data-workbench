@@ -2035,8 +2035,12 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         try:
-            if u.path in ("/", "/index.html"):
+            if u.path in ("/", "/index.html", "/new"):
                 html = (WEB_DIR / "index.html").read_bytes()
+                return self._send(200, html, "text/html; charset=utf-8")
+            # 旧版界面：新旧两套页面同时可用，页面内互相跳转
+            if u.path in ("/legacy", "/legacy.html", "/old"):
+                html = (WEB_DIR / "legacy.html").read_bytes()
                 return self._send(200, html, "text/html; charset=utf-8")
             if u.path == "/api/state":
                 return self._json(api_state())
