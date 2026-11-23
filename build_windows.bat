@@ -2,6 +2,12 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 
+rem 版本号取自 assets\release-version.txt（与 Release tag 保持一致）
+set "APPVER="
+if exist "assets\release-version.txt" set /p APPVER=<assets\release-version.txt
+if not defined APPVER set "APPVER=1.3.6"
+set "ZIPNAME=personal-data-workbench-v%APPVER%-win64.zip"
+
 rem 优先用 python.org 安装目录里的解释器，避免 WindowsApps 的 0 字节应用别名
 rem 其次用 py 启动器，最后才退回 PATH 上的 python
 set "PYEXE="
@@ -38,12 +44,12 @@ if errorlevel 1 goto fail
 
 echo [3/3] 生成升级 zip...
 if not exist "..\release" mkdir "..\release"
-powershell -NoProfile -Command "Compress-Archive -Path 'dist\快手数据工作台\快手数据工作台.exe','dist\快手数据工作台\_internal' -DestinationPath '..\release\personal-data-workbench-v1.2.9-fixed-win64.zip' -Force"
+powershell -NoProfile -Command "Compress-Archive -Path 'dist\快手数据工作台\快手数据工作台.exe','dist\快手数据工作台\_internal' -DestinationPath '..\release\%ZIPNAME%' -Force"
 if errorlevel 1 goto fail
 
 echo.
 echo 完成：%CD%\dist\快手数据工作台
-echo 升级包：%CD%\..\release\personal-data-workbench-v1.2.9-fixed-win64.zip
+echo 升级包：%CD%\..\release\%ZIPNAME%
 pause
 exit /b 0
 
