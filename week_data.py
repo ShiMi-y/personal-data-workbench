@@ -45,7 +45,7 @@ def _export_ok(start: str, end: str) -> Path | None:
     return csv
 
 
-SYT_NAME_RE = re.compile(r"商品列表(\d{8})_(\d{8})_")
+SYT_NAME_RE = re.compile(r"商品列表(\d{8})_(\d{8})(?:_|\.)")
 
 
 def _syt_file(day: date, tolerance_days: int = 3) -> Path | None:

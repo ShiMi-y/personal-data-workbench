@@ -5,9 +5,10 @@
   1. 打开 syt.kwaixiaodian.com/zones/goodsManagement/goods_list
   2. 关掉新手引导浮层
   3. 选日期：自然周（上一周）或「近30日」平台预设
-  4. 点「下载数据」→ 平台异步生成任务
-  5. 进下载中心，按「提交时间晚于任务开始时间」识别本次新记录
-  6. 等它完成后点「下载」落盘，openpyxl 校验表头与行数，写同名 .meta.json
+  4. 点「下载数据」：
+     · 新版平台同步导出，点击即直接下载（商品列表YYYYMMDD_YYYYMMDD.xls）
+     · 旧版平台异步生成任务，则回退到「下载中心轮询」
+  5. 新版的 .xls 统一转成 .xlsx，openpyxl 校验表头与行数，写同名 .meta.json
 
 用法：
   python export_syt.py --mode both
@@ -38,7 +39,7 @@ import kx_core as kx
 GOODS_LIST = "https://syt.kwaixiaodian.com/zones/goodsManagement/goods_list"
 DOWNLOAD_CENTER = "https://syt.kwaixiaodian.com/zones/syt-download-center/syt-download-record"
 EXPECT_HEADER = ["商品ID", "商品名称", "成交件数", "成交退款率(订单)", "成交金额"]
-RECORD_RE = re.compile(r"商品列表(\d{8}_\d{8})_(\d+)\.xlsx")
+RECORD_RE = re.compile(r"商品列表(\d{8}_\d{8})(?:_(\d+))?\.(?:xlsx|xls)")
 TIME_RE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
 
@@ -174,10 +175,54 @@ def pick_range(page: Page, start: date, end: date, logger=print) -> None:
     raise RuntimeError(f"日期选择器里选不到 {s_iso}~{e_iso}")
 
 
-def click_export(page: Page, logger=print) -> None:
-    page.get_by_text("下载数据", exact=True).first.click(timeout=10000)
-    page.wait_for_timeout(3000)
-    logger("[syt] 已点「下载数据」，平台开始生成任务")
+def export_direct(page: Page, out_dir: Path, start: date, end: date,
+                  logger=print) -> Path | None:
+    """点「下载数据」并接住平台直接下发的文件
+
+    新版平台是同步导出：点击后接口直接返回下载直链，浏览器立即开始下载；
+    旧版平台是异步任务（下载中心轮询），此处返回 None 交给调用方回退处理。
+    """
+    try:
+        with page.expect_download(timeout=45000) as dl:
+            page.get_by_text("下载数据", exact=True).first.click(timeout=10000)
+        d = dl.value
+    except Exception as exc:  # noqa: BLE001
+        logger(f"[syt] 点击后未直接产生下载（{type(exc).__name__}），回退下载中心轮询")
+        return None
+    suffix = Path(d.suggested_filename).suffix.lower() or ".xls"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"商品列表{start:%Y%m%d}_{end:%Y%m%d}{suffix}"
+    d.save_as(str(path))
+    logger(f"[syt] 已点「下载数据」并直接下载：{d.suggested_filename}（{path.stat().st_size} B）")
+    return path
+
+
+def normalize_file(path: Path) -> Path:
+    """统一成 openpyxl 可读的 .xlsx（新版导出的是 BIFF8 .xls）"""
+    with path.open("rb") as f:
+        head = f.read(8)
+    if head.startswith(b"\xd0\xcf\x11\xe0"):
+        import openpyxl
+        import xlrd
+
+        book = xlrd.open_workbook(str(path))
+        sh = book.sheet_by_index(0)
+        dst = path.with_suffix(".xlsx")
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = (sh.name or "Sheet0")[:31]
+        for r in range(sh.nrows):
+            ws.append([sh.cell_value(r, c) for c in range(sh.ncols)])
+        wb.save(dst)
+        wb.close()
+        path.unlink(missing_ok=True)
+        print(f"[syt] 已转为 xlsx：{dst.name}（{dst.stat().st_size} B）")
+        return dst
+    if path.suffix.lower() != ".xlsx":
+        dst = path.with_suffix(".xlsx")
+        path.replace(dst)
+        return dst
+    return path
 
 
 def scan_records(dc: Page) -> list[dict]:
@@ -194,8 +239,8 @@ def scan_records(dc: Page) -> list[dict]:
             continue
         tm = TIME_RE.search(str(t))
         out.append({
-            "id": m.group(2),
-            "file": f"商品列表{m.group(1)}_{m.group(2)}.xlsx",
+            "id": m.group(2) or "",
+            "file": m.group(0),
             "time": tm.group(1) if tm else "",
         })
     return out
@@ -211,7 +256,7 @@ def fetch_new_record(ctx, dc: Page, since: str, out_dir: Path,
         recs = scan_records(dc)
         new = [r for r in recs if r["time"] and r["time"] >= since]
         if new:
-            new.sort(key=lambda r: (r["time"], int(r["id"])))
+            new.sort(key=lambda r: (r["time"], int(r["id"] or 0)))
             rec = new[-1]
             fname = rec["file"]
             row = dc.locator("tr", has_text=fname).first
@@ -220,7 +265,7 @@ def fetch_new_record(ctx, dc: Page, since: str, out_dir: Path,
             except Exception:  # noqa: BLE001
                 row_txt = ""
             if "下载完成" in row_txt:
-                logger(f"[syt] 新记录 {rec['id']} 已完成：{fname}")
+                logger(f"[syt] 新记录已完成：{fname}")
                 with dc.expect_download(timeout=60000) as dl:
                     row.get_by_text("下载", exact=True).first.click(timeout=15000)
                 d = dl.value
@@ -231,7 +276,7 @@ def fetch_new_record(ctx, dc: Page, since: str, out_dir: Path,
                 return path
             if "失败" in row_txt:
                 raise RuntimeError(f"平台任务失败：{fname}")
-            logger(f"[syt] 新记录 {rec['id']} 生成中：{fname}")
+            logger(f"[syt] 新记录生成中：{fname}")
         time.sleep(3)
     raise TimeoutError(f"{timeout_s}s 内未等到新任务完成")
 
@@ -262,11 +307,8 @@ def verify(path: Path) -> dict:
 
 def run_one(ctx, dc: Page, mode: str, start: date, end: date, out_dir: Path,
             timeout_s: int, logger=print) -> dict:
-    # 先停在下载中心取当前时间作为基线：平台记录 id 不递增，只能用提交时间判断
-    dc.goto(DOWNLOAD_CENTER, wait_until="domcontentloaded", timeout=60000)
-    dc.wait_for_timeout(4000)
+    # 旧版异步任务按「提交时间 >= since」判断新记录；提前取基线，兼容两种平台形态
     since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    logger(f"[syt] 任务基线时间={since}")
 
     page = ctx.new_page()
     page.goto(GOODS_LIST, wait_until="domcontentloaded", timeout=60000)
@@ -280,16 +322,18 @@ def run_one(ctx, dc: Page, mode: str, start: date, end: date, out_dir: Path,
         except Exception as exc:  # noqa: BLE001
             logger(f"[syt] 自定义区间失败（{exc}），回退「近30日」预设")
             pick_preset(page, "近30日", logger)
-    click_export(page, logger)
+    path = export_direct(page, out_dir, start, end, logger)
+    if path is None:
+        logger(f"[syt] 任务基线时间={since}")
+        path = fetch_new_record(ctx, dc, since, out_dir, timeout_s, logger)
     page.close()
 
-    path = fetch_new_record(ctx, dc, since, out_dir, timeout_s, logger)
+    path = normalize_file(path)
     info = verify(path)
-    m = RECORD_RE.match(path.name)
     info.update({"mode": mode,
-                 "start": m.group(1).split("_")[0] if m else "",
-                 "end": m.group(1).split("_")[1] if m else "",
-                 "record_id": m.group(2) if m else ""})
+                 "start": f"{start:%Y%m%d}",
+                 "end": f"{end:%Y%m%d}",
+                 "record_id": ""})
     (path.with_suffix(".meta.json")).write_text(
         json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     return info
