@@ -45,10 +45,114 @@ WEB_DIR = kx.BUNDLE_DIR / "web"  # 打包后页面资源在解包目录
 
 CFG = kx.load_config()
 CFG_LOCK = threading.Lock()
-REALTIME_LOCK = threading.Lock()
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 _SINGLE_INSTANCE_MUTEX = None
+
+# ---------------------------------------------------------------------------
+# 任务互斥：日数据 / 实时数据 / 周数据 / 账户列表刷新 同一时间只允许一个。
+# 原因：它们共用同一个 Chrome 持久化目录，并发启动会出现
+# TargetClosedError: Target page, context or browser has been closed。
+# ---------------------------------------------------------------------------
+TASK_LOCK = threading.Lock()
+TASK_IDLE = threading.Condition(TASK_LOCK)
+ACTIVE_TASK: dict | None = None
+TASK_LABELS = {
+    "export": "日数据",
+    "realtime": "实时数据",
+    "week": "周数据",
+    "accounts": "账户列表刷新",
+}
+
+
+class TaskBusy(RuntimeError):
+    """已有其它取数任务在运行"""
+
+    def __init__(self, busy: dict):
+        self.busy = busy
+        super().__init__(busy_message(busy))
+
+
+def busy_message(busy: dict) -> str:
+    return f"{busy.get('label') or '任务'}在获取中，请等待获取完成后操作"
+
+
+def _public_task(task: dict) -> dict:
+    """去掉不可序列化的回调，供 API 返回"""
+    return {k: v for k, v in task.items() if k not in ("cancel", "interrupt")}
+
+
+def _task_current() -> dict | None:
+    with TASK_LOCK:
+        return _public_task(ACTIVE_TASK) if ACTIVE_TASK else None
+
+
+def _task_raw() -> dict | None:
+    with TASK_LOCK:
+        return dict(ACTIVE_TASK) if ACTIVE_TASK else None
+
+
+def _task_begin(kind: str, task_id: str, cancel=None, interrupt=None) -> tuple[bool, dict | None]:
+    """登记任务占用；成功返回 (True, None)，失败返回 (False, 当前占用者)
+
+    cancel: 查询是否已收到停止指令（取数循环里轮询）
+    interrupt: 真正发起中断（供其它任务抢占时调用）
+    """
+    global ACTIVE_TASK
+    with TASK_LOCK:
+        if ACTIVE_TASK:
+            return False, _public_task(ACTIVE_TASK)
+        ACTIVE_TASK = {
+            "kind": kind,
+            "label": TASK_LABELS.get(kind, kind),
+            "task_id": task_id,
+            "started": round(time.time(), 2),
+            "cancel": cancel,
+            "interrupt": interrupt,
+        }
+        return True, None
+
+
+def _task_end(task_id: str):
+    global ACTIVE_TASK
+    with TASK_LOCK:
+        if ACTIVE_TASK and ACTIVE_TASK.get("task_id") == task_id:
+            ACTIVE_TASK = None
+        TASK_IDLE.notify_all()
+
+
+def _task_wait_release(task_id: str, timeout: float = 150.0) -> bool:
+    """等待指定任务释放占用（中断实时任务后，等浏览器真正关闭）"""
+    deadline = time.time() + timeout
+    with TASK_LOCK:
+        while ACTIVE_TASK and ACTIVE_TASK.get("task_id") == task_id:
+            left = deadline - time.time()
+            if left <= 0:
+                return False
+            TASK_IDLE.wait(min(left, 1.0))
+    return True
+
+
+def _task_begin_or_interrupt(kind: str, task_id: str, cancel=None,
+                             allow_interrupt_realtime: bool = False) -> dict | None:
+    """尝试占用；返回 None 表示成功，否则返回占用者信息。
+
+    allow_interrupt_realtime=True 时，若占用的正是实时数据任务，
+    先真正发起中断，再等它释放，然后占用。
+    """
+    ok, busy = _task_begin(kind, task_id, cancel)
+    if ok:
+        return None
+    if allow_interrupt_realtime and busy and busy.get("kind") == "realtime":
+        raw = _task_raw() or {}
+        cb = raw.get("interrupt")
+        if cb:
+            cb()
+        if _task_wait_release(busy.get("task_id"), timeout=150):
+            ok2, busy2 = _task_begin(kind, task_id, cancel)
+            return None if ok2 else busy2
+    return busy
+
 
 
 def _job_new(kind: str) -> str:
@@ -194,6 +298,7 @@ def api_state() -> dict:
         "realtime": _tag_legacy_realtime(kx.load_realtime_cache(), cfg),
         "headless": bool(cfg.get("headless", True)),
         "has_credentials": any(a.get("has_password") for a in login_accounts),
+        "active_task": _task_current(),
         "exports": sorted([p.name for p in (kx.DATA_DIR / "exports").glob("*") if p.is_dir()], reverse=True)[:20]
         if (kx.DATA_DIR / "exports").exists() else [],
     }
@@ -514,10 +619,16 @@ def _notify_alerts(alerts: list[dict], cfg: dict, logger=None):
 
 
 def collect_realtime(cfg: dict, owners: list[dict] | None = None, logger=print,
-                     blocking: bool = True) -> dict | None:
+                     blocking: bool = True, cancel=None, task_id: str | None = None,
+                     pre_acquired: bool = False) -> dict | None:
     """抓取一次实时数据并保存缓存/触发预警；供页面任务与后台调度共用"""
-    if not REALTIME_LOCK.acquire(blocking=blocking):
-        return None
+    tid = task_id or f"auto-{uuid.uuid4().hex[:8]}"
+    if not pre_acquired:
+        ok, busy = _task_begin("realtime", tid, cancel=cancel)
+        if not ok:
+            if blocking:
+                raise TaskBusy(busy or {})
+            return None
     try:
         if owners is None:
             owners = _enabled_login_accounts(cfg)
@@ -525,11 +636,13 @@ def collect_realtime(cfg: dict, owners: list[dict] | None = None, logger=print,
         acc_rows, prod_rows, alerts, failures, owners_done = [], [], [], [], []
         total_cost = total_gmv = total_orders = 0.0
         for acct in owners:
+            if cancel and cancel():
+                raise kx.CancelledError("实时数据取数已中断")
             label = acct.get("label") or acct.get("id")
             logger(f"[实时] 账号「{label}」开始…")
             try:
                 ecfg = kx.account_cfg(cfg, acct)
-                res = kx.fetch_today(ecfg, None, logger=logger)
+                res = kx.fetch_today(ecfg, None, logger=logger, cancel=cancel)
                 acc_rows.extend(_tag_accounts(res.get("accounts"), acct))
                 prod_rows.extend(_tag_accounts(res.get("products"), acct))
                 for f in res.get("failures") or []:
@@ -544,6 +657,9 @@ def collect_realtime(cfg: dict, owners: list[dict] | None = None, logger=print,
                 total_gmv += float(t.get("gmv") or 0)
                 total_orders += float(t.get("order_cnt") or 0)
                 owners_done.append({"id": str(acct.get("id")), "label": label, "ok": True})
+            except kx.CancelledError:
+                logger(f"[实时] 已中断，账号「{label}」未完成")
+                raise
             except Exception as e:  # noqa: BLE001
                 logger(f"[实时] 账号「{label}」失败: {type(e).__name__}: {e}")
                 failures.append({"owner_id": str(acct.get("id")), "owner_label": label,
@@ -575,7 +691,7 @@ def collect_realtime(cfg: dict, owners: list[dict] | None = None, logger=print,
         _notify_alerts(alerts, cfg, logger=logger)
         return combined
     finally:
-        REALTIME_LOCK.release()
+        _task_end(tid)
 
 
 def _hm_minutes(value, default: str) -> int:
@@ -631,7 +747,7 @@ def realtime_scheduler_loop():
             res = collect_realtime(cfg, owners, logger=lambda m: print(f"[auto] {m}"),
                                    blocking=False)
             if res is None:
-                print("[auto] 已有实时任务在运行，本轮跳过")
+                print("[auto] 已有任务在获取中，本轮自动刷新跳过")
         except Exception as e:  # noqa: BLE001
             print(f"[auto] 自动刷新失败: {type(e).__name__}: {e}")
 
@@ -2118,35 +2234,49 @@ class Handler(BaseHTTPRequestHandler):
                 except RuntimeError as e:
                     return self._json({"error": str(e)}, 400)
                 jid = _job_new("export")
+                busy = _task_begin_or_interrupt(
+                    "export", jid, cancel=lambda: _job_cancelled(jid),
+                    allow_interrupt_realtime=bool(body.get("interrupt")))
+                if busy:
+                    with JOBS_LOCK:
+                        JOBS.pop(jid, None)
+                    return self._json({"error": busy_message(busy), "busy": busy}, 409)
 
                 def work():
                     results, failures = [], []
                     stopped = False
-                    for acct in owners:
-                        if _job_cancelled(jid):
-                            stopped = True
-                            _job_log(jid, "[export] 收到停止指令，已中止")
-                            break
-                        label = acct.get("label") or acct.get("id")
-                        _job_log(jid, f"[export] 账号「{label}」开始…")
-                        try:
-                            ecfg = kx.account_cfg(_config_snapshot(), acct)
-                            outdir = _export_owner_dir(start, end, str(acct.get("id")))
-                            s = export_full.run_export(ecfg, start, end, mapping.get(str(acct.get("id"))),
-                                                       outdir=outdir,
-                                                       logger=lambda m: _job_log(jid, m),
-                                                       cancel=lambda: _job_cancelled(jid))
-                            results.append({"owner_id": str(acct.get("id")), "owner_label": label, "summary": s})
-                        except Exception as e:  # noqa: BLE001
-                            _job_log(jid, f"[export] 账号「{label}」失败: {type(e).__name__}: {e}")
-                            failures.append({"owner_id": str(acct.get("id")), "owner_label": label,
-                                             "error": str(e)[:300]})
-                    if stopped:
-                        _job_done(jid, {"owners": results, "failures": failures, "cancelled": True})
-                    elif not results:
-                        _job_done(jid, error=f"全部账号导出失败（{len(failures)} 个）")
-                    else:
-                        _job_done(jid, {"owners": results, "failures": failures})
+                    try:
+                        for acct in owners:
+                            if _job_cancelled(jid):
+                                stopped = True
+                                _job_log(jid, "[export] 收到停止指令，已中止")
+                                break
+                            label = acct.get("label") or acct.get("id")
+                            _job_log(jid, f"[export] 账号「{label}」开始…")
+                            try:
+                                ecfg = kx.account_cfg(_config_snapshot(), acct)
+                                outdir = _export_owner_dir(start, end, str(acct.get("id")))
+                                s = export_full.run_export(ecfg, start, end, mapping.get(str(acct.get("id"))),
+                                                           outdir=outdir,
+                                                           logger=lambda m: _job_log(jid, m),
+                                                           cancel=lambda: _job_cancelled(jid))
+                                results.append({"owner_id": str(acct.get("id")), "owner_label": label, "summary": s})
+                            except Exception as e:  # noqa: BLE001
+                                if _job_cancelled(jid):
+                                    stopped = True
+                                    _job_log(jid, "[export] 收到停止指令，已中止")
+                                    break
+                                _job_log(jid, f"[export] 账号「{label}」失败: {type(e).__name__}: {e}")
+                                failures.append({"owner_id": str(acct.get("id")), "owner_label": label,
+                                                 "error": str(e)[:300]})
+                        if stopped:
+                            _job_done(jid, {"owners": results, "failures": failures, "cancelled": True})
+                        elif not results:
+                            _job_done(jid, error=f"全部账号导出失败（{len(failures)} 个）")
+                        else:
+                            _job_done(jid, {"owners": results, "failures": failures})
+                    finally:
+                        _task_end(jid)
 
                 threading.Thread(target=work, daemon=True).start()
                 return self._json({"job_id": jid})
@@ -2166,30 +2296,38 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/accounts":
                 body = self._body()
                 jid = _job_new("accounts")
+                busy = _task_begin("accounts", jid, cancel=lambda: _job_cancelled(jid))
+                if not busy[0]:
+                    with JOBS_LOCK:
+                        JOBS.pop(jid, None)
+                    return self._json({"error": busy_message(busy[1]), "busy": busy[1]}, 409)
 
                 def work_accounts():
-                    cfg = _config_snapshot()
                     try:
-                        owners = _enabled_login_accounts(cfg, body.get("owners") or None)
-                    except RuntimeError as e:
-                        _job_done(jid, error=str(e))
-                        return
-                    merged, failures = [], []
-                    for acct in owners:
-                        label = acct.get("label") or acct.get("id")
-                        _job_log(jid, f"[accounts] 账号「{label}」获取账户列表…")
+                        cfg = _config_snapshot()
                         try:
-                            ecfg = kx.account_cfg(cfg, acct)
-                            accs = kx.fetch_accounts(ecfg, logger=lambda m: _job_log(jid, m))
-                            merged.extend(_tag_accounts(accs, acct))
-                        except Exception as e:  # noqa: BLE001
-                            _job_log(jid, f"[accounts] 账号「{label}」失败: {type(e).__name__}: {e}")
-                            failures.append({"owner_id": str(acct.get("id")), "owner_label": label,
-                                             "error": str(e)[:300]})
-                    if merged:
-                        _job_done(jid, {"accounts": merged, "failures": failures})
-                    else:
-                        _job_done(jid, error="全部账号获取账户列表失败")
+                            owners = _enabled_login_accounts(cfg, body.get("owners") or None)
+                        except RuntimeError as e:
+                            _job_done(jid, error=str(e))
+                            return
+                        merged, failures = [], []
+                        for acct in owners:
+                            label = acct.get("label") or acct.get("id")
+                            _job_log(jid, f"[accounts] 账号「{label}」获取账户列表…")
+                            try:
+                                ecfg = kx.account_cfg(cfg, acct)
+                                accs = kx.fetch_accounts(ecfg, logger=lambda m: _job_log(jid, m))
+                                merged.extend(_tag_accounts(accs, acct))
+                            except Exception as e:  # noqa: BLE001
+                                _job_log(jid, f"[accounts] 账号「{label}」失败: {type(e).__name__}: {e}")
+                                failures.append({"owner_id": str(acct.get("id")), "owner_label": label,
+                                                 "error": str(e)[:300]})
+                        if merged:
+                            _job_done(jid, {"accounts": merged, "failures": failures})
+                        else:
+                            _job_done(jid, error="全部账号获取账户列表失败")
+                    finally:
+                        _task_end(jid)
 
                 threading.Thread(target=work_accounts, daemon=True).start()
                 return self._json({"job_id": jid})
@@ -2216,11 +2354,22 @@ class Handler(BaseHTTPRequestHandler):
                 except RuntimeError as e:
                     return self._json({"error": str(e)}, 400)
                 jid = _job_new("realtime")
+                busy = _task_begin("realtime", jid, cancel=lambda: _job_cancelled(jid),
+                                   interrupt=lambda: _job_cancel(jid))
+                if not busy[0]:
+                    with JOBS_LOCK:
+                        JOBS.pop(jid, None)
+                    return self._json({"error": busy_message(busy[1]), "busy": busy[1]}, 409)
 
                 def work_realtime():
                     try:
-                        combined = collect_realtime(cfg, owners, logger=lambda m: _job_log(jid, m))
+                        combined = collect_realtime(cfg, owners, logger=lambda m: _job_log(jid, m),
+                                                    cancel=lambda: _job_cancelled(jid),
+                                                    task_id=jid, pre_acquired=True)
                         _job_done(jid, combined)
+                    except kx.CancelledError:
+                        _job_log(jid, "[实时] 已中断，本次结果丢弃")
+                        _job_done(jid, {"cancelled": True})
                     except Exception as e:  # noqa: BLE001
                         _job_log(jid, f"异常: {type(e).__name__}: {e}")
                         _job_done(jid, error=f"{type(e).__name__}: {e}")
@@ -2344,6 +2493,11 @@ class Handler(BaseHTTPRequestHandler):
                 body = self._body()
                 owner = str(body.get("owner") or "").strip() or None
                 jid = _job_new("syt")
+                busy = _task_begin("week", jid, cancel=lambda: _job_cancelled(jid))
+                if not busy[0]:
+                    with JOBS_LOCK:
+                        JOBS.pop(jid, None)
+                    return self._json({"error": busy_message(busy[1]), "busy": busy[1]}, 409)
 
                 def work_syt():
                     try:
@@ -2352,6 +2506,8 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception as e:  # noqa: BLE001
                         _job_log(jid, f"[syt] 失败: {type(e).__name__}: {e}")
                         _job_done(jid, error=f"{type(e).__name__}: {e}")
+                    finally:
+                        _task_end(jid)
 
                 threading.Thread(target=work_syt, daemon=True).start()
                 return self._json({"job_id": jid})
@@ -2371,6 +2527,13 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/week/collect":
                 body = self._body()
                 jid = _job_new("week")
+                busy = _task_begin_or_interrupt(
+                    "week", jid, cancel=lambda: _job_cancelled(jid),
+                    allow_interrupt_realtime=bool(body.get("interrupt")))
+                if busy:
+                    with JOBS_LOCK:
+                        JOBS.pop(jid, None)
+                    return self._json({"error": busy_message(busy), "busy": busy}, 409)
 
                 def work_week():
                     try:
@@ -2379,6 +2542,8 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception as e:  # noqa: BLE001
                         _job_log(jid, f"[week] 失败: {type(e).__name__}: {e}")
                         _job_done(jid, error=f"{type(e).__name__}: {e}")
+                    finally:
+                        _task_end(jid)
 
                 threading.Thread(target=work_week, daemon=True).start()
                 return self._json({"job_id": jid})
@@ -2386,6 +2551,13 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/week/retry":
                 body = self._body()
                 jid = _job_new("week")
+                busy = _task_begin_or_interrupt(
+                    "week", jid, cancel=lambda: _job_cancelled(jid),
+                    allow_interrupt_realtime=bool(body.get("interrupt")))
+                if busy:
+                    with JOBS_LOCK:
+                        JOBS.pop(jid, None)
+                    return self._json({"error": busy_message(busy), "busy": busy}, 409)
 
                 def work_week_retry():
                     try:
@@ -2394,6 +2566,8 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception as e:  # noqa: BLE001
                         _job_log(jid, f"[week] 重试失败: {type(e).__name__}: {e}")
                         _job_done(jid, error=f"{type(e).__name__}: {e}")
+                    finally:
+                        _task_end(jid)
 
                 threading.Thread(target=work_week_retry, daemon=True).start()
                 return self._json({"job_id": jid})

@@ -25,6 +25,11 @@ from typing import Iterable
 
 import app_secret
 
+
+class CancelledError(RuntimeError):
+    """任务被用户中断（例如取日数据前中断正在跑的实时取数）"""
+
+
 # Playwright 只在真正启动浏览器时导入：这样配置、导出、合并等纯逻辑
 # 可以在未安装 playwright 的环境（如 WSL 单元测试）里直接运行。
 
@@ -38,7 +43,7 @@ else:
     BUNDLE_DIR = BASE
 
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "1.3.7"
+APP_VERSION = "1.3.8"
 PROFILE_DIR = BASE / ".browser_profile"
 PROFILES_DIR = BASE / ".browser_profiles"
 DATA_DIR = BASE / "data"
@@ -904,7 +909,8 @@ def today_str() -> str:
     return datetime.now(CST).strftime("%Y-%m-%d")
 
 
-def fetch_today(cfg: dict, account_ids: list[str] | None = None, logger=print) -> dict:
+def fetch_today(cfg: dict, account_ids: list[str] | None = None, logger=print,
+                cancel=None) -> dict:
     """当日实时数据：全账号 × 全商品，聚合到账户维度（只写缓存，不落导出目录）"""
     started = time.time()
     day = datetime.strptime(today_str(), "%Y-%m-%d").replace(tzinfo=CST)
@@ -925,9 +931,13 @@ def fetch_today(cfg: dict, account_ids: list[str] | None = None, logger=print) -
         logger(f"[实时] 账户 {len(accounts)} 个，查询日期 {day:%Y-%m-%d}"
                + (f"，失败最多重试 {retry_max} 次" if retry_max else "，不重试"))
         for acc in accounts:
+            if cancel and cancel():
+                raise CancelledError("实时数据取数已中断")
             aid, aname = str(acc["id"]), acc.get("name") or ""
             attempt = 0
             while True:
+                if cancel and cancel():
+                    raise CancelledError("实时数据取数已中断")
                 home = None
                 try:
                     home = client.open_account(aid)

@@ -166,6 +166,7 @@
           background:var(--brand);color:#fff;font-size:13px;font-weight:500;text-decoration:none;
           box-shadow:0 2px 6px rgba(37,99,235,.25);transition:.15s}
   .v2jump:hover{background:#1d4ed8;color:#fff}
+#rtTime.err { color: #b42318; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -554,6 +555,67 @@ async function api(path, opt) {
   return j;
 }
 
+let _modalDone = null;
+
+function _modalShow(title, message, opt) {
+  return new Promise((resolve) => {
+    const mask = $('#modalMask');
+    if (!mask || !$('#modalOk')) { resolve(window.confirm(message)); return; }
+    $('#modalTitle').textContent = title || '提示';
+    $('#modalMsg').textContent = message || '';
+    const ok = $('#modalOk'), cancel = $('#modalCancel');
+    ok.textContent = (opt && opt.okText) || '确定';
+    ok.className = 'modal-btn ' + ((opt && opt.danger) ? 'danger' : 'primary');
+    if (opt && opt.alert) {
+      cancel.style.display = 'none';
+    } else {
+      cancel.style.display = '';
+      cancel.textContent = (opt && opt.cancelText) || '取消';
+    }
+    mask.classList.add('show');
+    const finish = (v) => {
+      mask.classList.remove('show');
+      ok.onclick = null; cancel.onclick = null; _modalDone = null;
+      resolve(v);
+    };
+    _modalDone = () => finish(false);
+    ok.onclick = () => finish(true);
+    cancel.onclick = () => finish(false);
+    ok.focus();
+  });
+}
+
+function uiAlert(message, opt) {
+  return _modalShow((opt && opt.title) || '提示', message,
+    Object.assign({ alert: true, okText: '知道了' }, opt || {}));
+}
+
+function uiConfirm(message, opt) {
+  return _modalShow((opt && opt.title) || '请确认', message, opt || {});
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && _modalDone) _modalDone();
+});
+
+async function apiTask(path, payload, opt) {
+  const post = (p) => api(path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p),
+  });
+  try {
+    return await post(payload);
+  } catch (e) {
+    const busy = e.data && e.data.busy;
+    if (busy && opt && opt.interruptRealtime && busy.kind === 'realtime') {
+      const ok = await uiConfirm(
+        `${busy.label}正在获取，是否中断它以开始本次操作？\n\n中断后本次实时数据会丢弃，实时面板保留上次缓存。`,
+        { title: '任务冲突', okText: '中断实时数据并开始获取', cancelText: '等待获取完成', danger: true });
+      if (ok) return await post(Object.assign({}, payload, { interrupt: true }));
+    }
+    throw new Error(e.message || (busy ? `${busy.label}在获取中，请等待获取完成后操作` : '请求失败'));
+  }
+}
+
 function showLog(on) {
   $('#log').classList.toggle('show', on);
   $('#btnToggleLog').textContent = on ? '隐藏日志' : '显示日志';
@@ -750,7 +812,7 @@ async function saveDav() {
   const url = $('#cfgDavUrl').value.trim();
   const user = $('#cfgDavUser').value.trim();
   const pwd = $('#cfgDavPass').value;
-  if (!url || !user) return alert('请填写 WebDAV 地址和用户名');
+  if (!url || !user) { await uiAlert('请填写 WebDAV 地址和用户名'); return; }
   $('#davHint').textContent = '保存中…';
   try {
     const r = await api('/api/webdav', {
@@ -812,7 +874,7 @@ async function exportDavPrivate() {
   const p1 = prompt('设置私有文件口令（跨设备解锁用，请妥善保管）');
   if (!p1) return;
   const p2 = prompt('再次输入同一口令');
-  if (p2 !== p1) return alert('两次输入的口令不一致');
+  if (p2 !== p1) { await uiAlert('两次输入的口令不一致'); return; }
   try {
     const r = await api('/api/webdav/private', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -847,7 +909,7 @@ async function lockDavPrivate() {
 }
 
 async function clearDavPrivate() {
-  if (!confirm('删除程序目录下的 webdav_private.dat？')) return;
+  if (!(await uiConfirm('删除程序目录下的 webdav_private.dat？', { okText: '删除', danger: true }))) return;
   try {
     const r = await api('/api/webdav/private', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -860,7 +922,7 @@ async function clearDavPrivate() {
 }
 
 async function clearDav() {
-  if (!confirm('清除本机保存的 WebDAV 连接信息？')) return;
+  if (!(await uiConfirm('清除本机保存的 WebDAV 连接信息？', { okText: '清除', danger: true }))) return;
   try {
     await api('/api/webdav', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -961,7 +1023,7 @@ async function sideCheckUpdate() {
 
 async function sideApplyUpdate() {
   if (!state.update || !state.update.has_update) return;
-  if (!confirm(`升级到 v${state.update.latest}？\n程序会自动退出、替换程序文件并重启；配置、账号、登录态、数据都保留。`)) return;
+  if (!(await uiConfirm(`升级到 v${state.update.latest}？\n程序会自动退出、替换程序文件并重启；配置、账号、登录态、数据都保留。`, { title: '升级确认', okText: '立即升级' }))) return;
   setSideUpdate('升级中…', true, true, '正在下载升级包…');
   setUpProgress({ phase: 'checking', text: '正在准备升级…' });
   try {
@@ -1179,7 +1241,7 @@ async function saveAccount() {
 async function deleteAccount(id) {
   const a = state.loginAccounts.find((x) => String(x.id) === String(id));
   if (!a) return;
-  if (!confirm(`删除账号「${a.label}」？\n配置会移除，但月度表、导出数据和登录态目录不会删除。`)) return;
+  if (!(await uiConfirm(`删除账号「${a.label}」？\n配置会移除，但月度表、导出数据和登录态目录不会删除。`, { okText: '删除', danger: true }))) return;
   try {
     await api('/api/login-accounts/delete', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }),
@@ -1273,7 +1335,7 @@ async function saveAlertThresholds() {
     }
     reevaluateAlerts();
   } catch (e) {
-    alert('保存预警线失败：' + e.message);
+    uiAlert('保存预警线失败：' + e.message);
   }
 }
 
@@ -1531,6 +1593,7 @@ async function refreshRealtime(auto = false) {
   const btn = $('#btnRealtime');
   btn.disabled = true;
   btn.textContent = '抓取中…';
+  $('#rtTime').classList.remove('err');
   $('#rtTime').textContent = '正在登录后台并抓取当日数据…';
   try {
     const { job_id } = await api('/api/realtime', {
@@ -1547,13 +1610,29 @@ async function refreshRealtime(auto = false) {
         $('#rtTime').textContent = last;
       }
       if (job.status === 'done' || job.status === 'error') {
-        if (job.status === 'error') $('#rtTime').textContent = '抓取失败：' + job.error;
-        else renderRealtime(job.result);
+        if (job.status === 'error') {
+          $('#rtTime').textContent = '抓取失败：' + job.error;
+          $('#rtTime').classList.add('err');
+        } else if (job.result && job.result.cancelled) {
+          $('#rtTime').textContent = '实时数据已中断，本次未更新';
+          $('#rtTime').classList.add('err');
+        } else {
+          renderRealtime(job.result);
+          $('#rtTime').classList.remove('err');
+        }
         break;
       }
     }
   } catch (e) {
-    $('#rtTime').textContent = '抓取失败：' + e.message;
+    const busy = e.data && e.data.busy;
+    if (busy) {
+      $('#rtTime').textContent = e.message;
+      $('#rtTime').classList.add('err');
+      if (!auto) uiAlert(e.message, { title: '任务冲突' });
+    } else {
+      $('#rtTime').textContent = '抓取失败：' + e.message;
+      $('#rtTime').classList.add('err');
+    }
   } finally {
     state.rtBusy = false;
     rtLastAuto = Date.now();
@@ -1657,26 +1736,25 @@ function renderPreview(p) {
   links.querySelectorAll('a').forEach((a) => a.addEventListener('click', async (e) => {
     e.preventDefault();
     try { await api('/api/open-file?path=' + encodeURIComponent(a.dataset.open)); }
-    catch (err) { alert('打开失败：' + err.message); }
+    catch (err) { uiAlert('打开失败：' + err.message); }
   }));
 }
 
 async function runExport() {
   const { start, end } = currentRange();
-  if (!start || !end) return alert('请选择日期');
+  if (!start || !end) { uiAlert('请选择日期'); return; }
   const ids = selectedIds();
   const byOwner = selectedByOwner();
-  if (!ids.length || !Object.keys(byOwner).length) return alert('请至少选择一个账户');
+  if (!ids.length || !Object.keys(byOwner).length) { uiAlert('请至少选择一个账户'); return; }
   const btn = $('#btnExport');
   btn.disabled = true;
   showLog(true);
   $('#log').innerHTML = '';
   logLine(`开始拉取：${start}${start !== end ? ' ~ ' + end : ''}，${Object.keys(byOwner).length} 个账号 / ${ids.length} 个账户`);
   try {
-    const { job_id } = await api('/api/export', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ start, end, owners: Object.keys(byOwner), accounts_by_owner: byOwner }),
-    });
+    const { job_id } = await apiTask('/api/export', {
+      start, end, owners: Object.keys(byOwner), accounts_by_owner: byOwner,
+    }, { interruptRealtime: true });
     let seen = 0;
     state.currentJob = job_id;
     updateStopBtn();
@@ -1708,12 +1786,12 @@ function updateStopBtn() {
 
 async function stopCurrentJob() {
   if (!state.currentJob) return;
-  if (!confirm('确定停止当前任务？已拉取的部分数据会保留。')) return;
+  if (!(await uiConfirm('确定停止当前任务？已拉取的部分数据会保留。', { okText: '停止任务', danger: true }))) return;
   try {
     await api('/api/job/cancel?id=' + encodeURIComponent(state.currentJob));
     logLine('已发送停止指令，等待当前账户结束后中止…');
   } catch (e) {
-    alert('停止失败：' + e.message);
+    uiAlert('停止失败：' + e.message);
   }
 }
 
@@ -1721,9 +1799,9 @@ async function runMerge() {
   const { start, end } = currentRange();
   const ids = selectedIds();
   const byOwner = selectedByOwner();
-  if (!ids.length || !Object.keys(byOwner).length) return alert('请至少选择一个账户');
+  if (!ids.length || !Object.keys(byOwner).length) { uiAlert('请至少选择一个账户'); return; }
   const bkText = (state.cfg && state.cfg.auto_backup === false) ? '未开启自动备份' : '会先自动备份';
-  if (!confirm(`确认把 ${start}${start !== end ? ' ~ ' + end : ''} 的 ${ids.length} 个账户数据合并进各自月度表？\n（${Object.keys(byOwner).length} 个账号，${bkText}）`)) return;
+  if (!(await uiConfirm(`确认把 ${start}${start !== end ? ' ~ ' + end : ''} 的 ${ids.length} 个账户数据合并进各自月度表？\n（${Object.keys(byOwner).length} 个账号，${bkText}）`, { title: '合并确认', okText: '开始合并' }))) return;
   const btn = $('#btnMerge');
   btn.disabled = true;
   $('#mergeBody').innerHTML = '<div class="empty">合并中…</div>';
@@ -1770,11 +1848,11 @@ async function runMerge() {
       </div>`;
     }).join('') || '<div class="empty">没有可合并的账号</div>');
     if (locked.length) {
-      alert(`合并未完成：以下月度表正被占用\n\n${locked.map((r) => `[${r.owner_label}] ${r.excel}`).join('\n')}\n\n请先关闭 WPS / Excel 后重试。`);
+      uiAlert(`合并未完成：以下月度表正被占用\n\n${locked.map((r) => `[${r.owner_label}] ${r.excel}`).join('\n')}\n\n请先关闭 WPS / Excel 后重试。`, { title: '月度表被占用' });
     } else {
-      alert(`合并完成\n起始：${res.started_at || '-'}\n完成：${res.finished_at || '-'}\n用时：${res.elapsed ?? '-'} 秒\n已保存：${savedN}/${results.length} 个账号`
+      uiAlert(`合并完成\n起始：${res.started_at || '-'}\n完成：${res.finished_at || '-'}\n用时：${res.elapsed ?? '-'} 秒\n已保存：${savedN}/${results.length} 个账号`
         + (addedN ? `\n新增商品列：${addedN} 个` : '')
-        + (failed.length ? `\n失败：${failed.length} 个账号` : ''));
+        + (failed.length ? `\n失败：${failed.length} 个账号` : ''), { title: '合并完成' });
     }
   } catch (e) {
     $('#mergeBody').innerHTML = `<div class="empty" style="color:var(--err)">合并失败：${escapeHtml(e.message)}</div>`;
@@ -2039,9 +2117,10 @@ async function runSyt() {
       if (c.range_csv && c.range_csv.exists) lines.push(`· 磁力金牛 30 日数据：${c.range_csv.mtime}`);
       if (c.syt_week && c.syt_week.exists) lines.push(`· 生意通周文件：${c.syt_week.mtime}`);
       if (c.syt_range && c.syt_range.exists) lines.push(`· 生意通30日文件：${c.syt_range.mtime}`);
-      reuse = window.confirm(
+      reuse = await uiConfirm(
         `以下数据已存在：\n\n${lines.join('\n')}\n\n` +
-        `点「确定」= 复用已有数据\n点「取消」= 重新导出全部数据（耗时长）`);
+        `点「确定」= 复用已有数据\n点「取消」= 重新导出全部数据（耗时长）`,
+        { title: '发现已有数据', okText: '复用已有数据', cancelText: '重新导出' });
     }
   } catch (e) { /* 查缓存失败不阻断，按重新导出处理 */ }
 
@@ -2054,10 +2133,7 @@ async function runSyt() {
   $('#btnRoi').disabled = true;
   body.reuse = reuse;
   try {
-    const { job_id } = await api('/api/week/collect', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const { job_id } = await apiTask('/api/week/collect', body, { interruptRealtime: true });
     const onLog = (m) => wkLog(m);
     onLog.shown = 0;
     const res = await pollJob(job_id, onLog);
@@ -2103,9 +2179,10 @@ async function runRoi() {
       body: JSON.stringify(body),
     });
     if (chk.exists) {
-      const ok = window.confirm(
+      const ok = await uiConfirm(
         `核算表已存在周期「${chk.label}」（第 ${chk.first}-${chk.total} 行）。\n\n` +
-        `点「确定」= 覆盖该周期\n点「取消」= 取消写入`);
+        `点「确定」= 覆盖该周期\n点「取消」= 取消写入`,
+        { title: '周期已存在', okText: '覆盖该周期', danger: true });
       if (!ok) { $('#wkHint').textContent = '已取消'; return; }
       body.overwrite = true;
     }
@@ -2149,5 +2226,15 @@ loadState().catch((e) => {
     `<div style="padding:12px;background:#fef2f2;color:#b91c1c">加载失败：${escapeHtml(e.message)}</div>`);
 });
 </script>
+<div id="modalMask" class="modal-mask">
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-title" id="modalTitle">提示</div>
+    <div class="modal-msg" id="modalMsg"></div>
+    <div class="modal-actions">
+      <button type="button" class="modal-btn" id="modalCancel">取消</button>
+      <button type="button" class="modal-btn primary" id="modalOk">知道了</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>
