@@ -43,7 +43,7 @@ else:
     BUNDLE_DIR = BASE
 
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "1.3.8"
+APP_VERSION = "1.4.0"
 PROFILE_DIR = BASE / ".browser_profile"
 PROFILES_DIR = BASE / ".browser_profiles"
 DATA_DIR = BASE / "data"
@@ -239,7 +239,8 @@ def _normalize_accounts(cfg: dict) -> bool:
         for k, v in (("login_role", "auto"), ("enabled", True),
                      ("include_accounts", []), ("exclude_accounts", []),
                      ("alert_thresholds", {}), ("legacy_profile", False),
-                     ("roi_book_path", ""), ("alert_cooldown_minutes", 30)):
+                     ("roi_book_path", ""), ("alert_cooldown_minutes", 30),
+                     ("excel_dir", "")):
             if k not in a:
                 a[k] = v
                 changed = True
@@ -306,6 +307,33 @@ def account_profile_dir(acct: dict) -> Path:
     return PROFILES_DIR / str(acct.get("id") or "default")
 
 
+def account_excel_dir(acct: dict) -> Path:
+    """月度表目录：优先 excel_dir；兼容旧配置 excel_path 的父目录；默认 data/月度表"""
+    raw_dir = str(acct.get("excel_dir") or "").strip()
+    if raw_dir:
+        return resolve_path(raw_dir)
+    raw_file = str(acct.get("excel_path") or "").strip()
+    if raw_file:
+        return resolve_path(raw_file).parent
+    return DATA_DIR / "月度表"
+
+
+def month_book_path(acct: dict) -> Path:
+    """月度表文件：每个账号一个，内含按月分的 sheet（消耗成交-YYMM）"""
+    return account_excel_dir(acct) / "快手消耗成交.xlsx"
+
+
+def legacy_excel_path(acct: dict) -> Path | None:
+    """旧版单文件月度表（用于首次自动迁移）"""
+    raw = str(acct.get("excel_path") or "").strip()
+    if not raw:
+        return None
+    p = resolve_path(raw)
+    if p.suffix.lower() in (".xlsx", ".xlsm") and p.exists():
+        return p
+    return None
+
+
 def account_cfg(cfg: dict, acct: dict) -> dict:
     """把全局配置与某个登录账号合并，供 Client / 导出 / 合并使用"""
     effective = dict(cfg)
@@ -314,6 +342,7 @@ def account_cfg(cfg: dict, acct: dict) -> dict:
         "password": app_secret.unprotect_text(acct.get("password")),
         "login_role": str(acct.get("login_role") or "auto"),
         "excel_path": str(acct.get("excel_path") or ""),
+        "excel_dir": str(acct.get("excel_dir") or ""),
         "roi_book_path": str(acct.get("roi_book_path") or ""),
         "include_accounts": list(acct.get("include_accounts") or []),
         "exclude_accounts": list(acct.get("exclude_accounts") or []),
@@ -835,12 +864,14 @@ def load_accounts_cache(owner: str | None = None) -> tuple[list[dict], str]:
 
 
 def excel_account_ids(path: Path) -> list[str]:
-    """读月度表第 3 行的账户ID（按动态商品组列扫描，兼容后加列）"""
+    """读月度表第 3 行的账户ID（自动取最新月份的 sheet，兼容动态商品列）"""
     try:
         from openpyxl import load_workbook
         wb = load_workbook(path, read_only=True)
         try:
-            ws = wb["消耗成交"] if "消耗成交" in wb.sheetnames else wb[wb.sheetnames[0]]
+            import month_table
+            name = month_table.pick_sheet_name(wb)
+            ws = wb[name] if name in wb.sheetnames else wb[wb.sheetnames[0]]
             max_col = int(ws.max_column or 0)
             total_start = None
             for c in range(2, max_col + 1):
@@ -883,13 +914,15 @@ def pick_accounts(all_accounts: list[dict], cfg: dict, ids: list[str] | None = N
         wanted = {str(x) for x in include}
         return [a for a in pool if a["id"] in wanted]
 
-    if cfg.get("filter_by_excel", True) and cfg.get("excel_path"):
+    if cfg.get("filter_by_excel", True):
         try:
-            excel = resolve_path(cfg["excel_path"])
+            book = month_book_path(cfg)
+            if not book.exists():
+                book = legacy_excel_path(cfg) or book
         except Exception:
-            excel = None
-        if excel and excel.exists():
-            table_ids = set(excel_account_ids(excel))
+            book = None
+        if book and book.exists():
+            table_ids = set(excel_account_ids(book))
             if table_ids:
                 inter = [a for a in pool if a["id"] in table_ids]
                 if inter:

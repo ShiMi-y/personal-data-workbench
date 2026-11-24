@@ -266,9 +266,11 @@ def _read_csv_rows(path: Path) -> list[dict]:
 
 def read_product_groups(path: Path) -> list[dict]:
     """读取月度表第 1~3 行的商品组（商品名 / 商品ID / 所属账户ID）"""
+    import month_table
     wb = load_workbook(path, read_only=True)
     try:
-        ws = wb[SHEET] if SHEET in wb.sheetnames else wb[wb.sheetnames[0]]
+        name = month_table.pick_sheet_name(wb)
+        ws = wb[name] if name in wb.sheetnames else wb[wb.sheetnames[0]]
         _total_start, cost_cols, _total_row = _layout(ws)
         out = []
         for col in cost_cols:
@@ -292,18 +294,13 @@ def run_merge(cfg: dict, start: str, end: str, account_ids: list[str] | None = N
               allow_partial: bool = False, logger=print) -> dict:
     started_at = datetime.now()
     if excel_path is None:
-        raw_excel = str(cfg.get("excel_path") or "").strip()
-        if not raw_excel:
-            raise RuntimeError("未配置月度表路径 excel_path")
-        excel_path = kx.resolve_path(raw_excel)
+        excel_path = kx.month_book_path(cfg)
     else:
         excel_path = Path(excel_path)
     export_dir = Path(export_dir) if export_dir else (kx.DATA_DIR / "exports" / f"{start}_{end}")
     csv_path = export_dir / "accounts.csv"
     if not csv_path.exists():
         raise FileNotFoundError(f"未找到导出数据: {csv_path}（请先执行导出）")
-    if not excel_path.exists():
-        raise FileNotFoundError(f"目标 Excel 不存在: {excel_path}")
 
     failures = _summary_failures(export_dir)
     if failures and not allow_partial:
@@ -379,10 +376,14 @@ def run_merge(cfg: dict, start: str, end: str, account_ids: list[str] | None = N
     if len(months) > 1:
         raise RuntimeError(f"日期范围跨月（{'、'.join(months)}），月度表只能合并单月数据")
 
+    import month_table
+    year, month = int(months[0][:4]), int(months[0][5:7])
+    legacy = kx.legacy_excel_path(cfg)
+    month_table.ensure_book(excel_path, legacy=legacy, logger=logger)
     wb = load_workbook(excel_path)
-    if SHEET not in wb.sheetnames:
-        raise RuntimeError(f"工作表不存在: {SHEET}，实际: {wb.sheetnames}")
-    ws = wb[SHEET]
+    ws, sheet_created = month_table.ensure_month_sheet(wb, year, month)
+    if sheet_created:
+        logger(f"[merge] 已按内置模板新建月度 sheet：{ws.title}")
 
     total_start, all_cost_cols, total_row = _layout(ws)
     data_last = total_row - 1
@@ -427,7 +428,7 @@ def run_merge(cfg: dict, start: str, end: str, account_ids: list[str] | None = N
             "pid": _cell_id(ws.cell(row=2, column=col).value),
             "name": str(ws.cell(row=1, column=col).value or "").strip(),
         })
-    if not specs:
+    if not specs and not wanted:
         raise RuntimeError("第 3 行未读取到账户ID，表结构不符")
 
     # 所选但月度表里没有的账户：在总计列前新增商品列
@@ -455,12 +456,25 @@ def run_merge(cfg: dict, start: str, end: str, account_ids: list[str] | None = N
             raise RuntimeError("所选账户都不在月度表内，且没有可新增的数据")
 
     if new_groups:
-        ref_col = all_cost_cols[-1] if all_cost_cols else GROUPS_START
-        old_total_start = total_start
-        total_start = _move_totals(ws, old_total_start, GROUP_WIDTH * len(new_groups))
-        for i, g in enumerate(new_groups):
-            g["col"] = old_total_start + GROUP_WIDTH * i
-            _build_group(ws, g["col"], g["name"], g["pid"], g["aid"], ref_col, total_row)
+        # 模板预留的空商品组优先复用，避免左侧留下空列
+        empty_cols = [c for c in all_cost_cols
+                      if not _cell_id(ws.cell(row=3, column=c).value)]
+        reuse = min(len(empty_cols), len(new_groups))
+        for i in range(reuse):
+            col = empty_cols[i]
+            g = new_groups[i]
+            ws.cell(row=1, column=col, value=g["name"])
+            ws.cell(row=2, column=col, value=g["pid"])
+            ws.cell(row=3, column=col, value=g["aid"])
+            g["col"] = col
+        rest = new_groups[reuse:]
+        if rest:
+            ref_col = all_cost_cols[-1] if all_cost_cols else GROUPS_START
+            old_total_start = total_start
+            total_start = _move_totals(ws, old_total_start, GROUP_WIDTH * len(rest))
+            for i, g in enumerate(rest):
+                g["col"] = old_total_start + GROUP_WIDTH * i
+                _build_group(ws, g["col"], g["name"], g["pid"], g["aid"], ref_col, total_row)
         all_cost_cols = list(range(GROUPS_START, total_start, GROUP_WIDTH))
         _write_formulas(ws, all_cost_cols, (total_start, total_start + 1, total_start + 2),
                         FIRST_DATA_ROW, data_last, total_row)

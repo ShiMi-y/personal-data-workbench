@@ -325,13 +325,16 @@ def _login_accounts_public(cfg: dict) -> list[dict]:
     for a in kx.login_accounts(cfg):
         p = str(a.get("excel_path") or "").strip()
         roi = str(a.get("roi_book_path") or "").strip()
+        book = kx.month_book_path(a)
         out.append({
             "id": str(a.get("id")),
             "label": str(a.get("label") or a.get("login_account") or a.get("id")),
             "login_account": str(a.get("login_account") or ""),
             "login_role": str(a.get("login_role") or "auto"),
+            "excel_dir": str(a.get("excel_dir") or ""),
             "excel_path": p,
-            "excel_exists": bool(p) and kx.resolve_path(p).exists(),
+            "excel_book": str(book),
+            "excel_exists": book.exists() or (bool(p) and kx.resolve_path(p).exists()),
             "roi_book_path": roi,
             "roi_book_exists": bool(roi) and kx.resolve_path(roi).exists(),
             "enabled": a.get("enabled", True) is not False,
@@ -389,17 +392,18 @@ def _excel_by_owner(cfg: dict) -> tuple[list[str], list[dict], int]:
     products: list[dict] = []
     ready = 0
     for a in kx.login_accounts(cfg):
-        p = str(a.get("excel_path") or "").strip()
-        if not p:
-            continue
-        path = kx.resolve_path(p)
-        if not path.exists():
+        book = kx.month_book_path(a)
+        if not book.exists():
+            legacy = kx.legacy_excel_path(a)
+            if legacy:
+                book = legacy
+        if not book.exists():
             continue
         ready += 1
-        for aid in _excel_accounts(path):
+        for aid in _excel_accounts(book):
             if aid not in account_ids:
                 account_ids.append(aid)
-        products.extend(_tag_accounts(_excel_products(path), a))
+        products.extend(_tag_accounts(_excel_products(book), a))
     return account_ids, products, ready
 
 
@@ -485,6 +489,45 @@ def pick_excel_file(current: str = "") -> str:
     if not ctypes.windll.comdlg32.GetOpenFileNameW(ctypes.byref(ofn)):
         return ""
     return buf.value
+
+
+def pick_directory(current: str = "") -> str:
+    """弹出 Windows 原生目录选择框，取消返回空串"""
+    import ctypes
+    from ctypes import wintypes
+
+    class BROWSEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("hwndOwner", wintypes.HWND),
+            ("pidlRoot", ctypes.c_void_p),
+            ("pszDisplayName", wintypes.LPWSTR),
+            ("lpszTitle", wintypes.LPCWSTR),
+            ("ulFlags", wintypes.UINT),
+            ("lpfn", ctypes.c_void_p),
+            ("lParam", wintypes.LPARAM),
+            ("iImage", ctypes.c_int),
+        ]
+
+    shell32 = ctypes.windll.shell32
+    ole32 = ctypes.windll.ole32
+    try:
+        ole32.CoInitialize(None)
+    except Exception:  # noqa: BLE001
+        pass
+    display = ctypes.create_unicode_buffer(260)
+    bi = BROWSEINFOW()
+    bi.hwndOwner = None
+    bi.pszDisplayName = ctypes.cast(display, wintypes.LPWSTR)
+    bi.lpszTitle = "选择月度表所在目录"
+    # BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
+    bi.ulFlags = 0x00000001 | 0x00000040
+    pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
+    if not pidl:
+        return ""
+    path_buf = ctypes.create_unicode_buffer(1024)
+    shell32.SHGetPathFromIDListW(pidl, path_buf)
+    ole32.CoTaskMemFree(pidl)
+    return path_buf.value
 
 
 CONFIG_KEYS = ("headless", "date_offset_days", "page_size",
@@ -878,6 +921,7 @@ def api_save_login_account(body: dict) -> dict:
             "login_account": "",
             "password": "",
             "login_role": "auto",
+            "excel_dir": "",
             "excel_path": "",
             "roi_book_path": "",
             "enabled": True,
@@ -907,6 +951,14 @@ def api_save_login_account(body: dict) -> dict:
         if role not in ("auto", "owner", "staff"):
             raise ValueError("登录身份只能是 auto / owner / staff")
         cur["login_role"] = role
+    if "excel_dir" in body:
+        d = str(body.get("excel_dir") or "").strip()
+        if d:
+            try:
+                Path(d).mkdir(parents=True, exist_ok=True)
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(f"月度表目录不可用: {e}")
+        cur["excel_dir"] = d
     if "excel_path" in body:
         p = str(body.get("excel_path") or "").strip()
         if p and Path(p).suffix.lower() not in EXCEL_SUFFIXES:
@@ -937,8 +989,10 @@ def api_save_login_account(body: dict) -> dict:
         cur["alert_cooldown_minutes"] = _as_int(
             body["alert_cooldown_minutes"], "预警冷却时间（分钟）", 0, 1440)
 
-    if not str(cur.get("login_account") or "").strip() and not str(cur.get("excel_path") or "").strip():
-        raise ValueError("请至少填写登录手机号或月度表路径")
+    if (not str(cur.get("login_account") or "").strip()
+            and not str(cur.get("excel_dir") or "").strip()
+            and not str(cur.get("excel_path") or "").strip()):
+        raise ValueError("请至少填写登录手机号或月度表目录")
 
     cfg["accounts"] = accounts
     _persist_config(cfg)
@@ -2176,6 +2230,7 @@ class Handler(BaseHTTPRequestHandler):
                 for a in kx.login_accounts(_config_snapshot()):
                     if a.get("excel_path"):
                         excel_paths.add(kx.resolve_path(str(a["excel_path"])).resolve())
+                    excel_paths.add(kx.month_book_path(a).resolve())
                 try:
                     under_data = p.is_relative_to(data_root)
                 except AttributeError:  # Python < 3.9
@@ -2344,6 +2399,14 @@ class Handler(BaseHTTPRequestHandler):
                     path = pick_excel_file(str(body.get("current") or ""))
                 except Exception as e:  # noqa: BLE001
                     return self._json({"error": f"打开文件选择框失败: {type(e).__name__}: {e}"}, 500)
+                return self._json({"path": path})
+
+            if u.path == "/api/pick-dir":
+                body = self._body() or {}
+                try:
+                    path = pick_directory(str(body.get("current") or ""))
+                except Exception as e:  # noqa: BLE001
+                    return self._json({"error": f"打开目录选择框失败: {type(e).__name__}: {e}"}, 500)
                 return self._json({"path": path})
 
             if u.path == "/api/realtime":
@@ -2612,6 +2675,20 @@ def _already_running(url: str) -> bool:
         return False
 
 
+def _ensure_month_books():
+    """启动时为每个账号准备月度表：缺失则用内置模板创建，或从旧单文件自动迁移"""
+    import month_table
+    for a in kx.login_accounts(CFG):
+        try:
+            book = kx.month_book_path(a)
+            legacy = kx.legacy_excel_path(a)
+            if month_table.ensure_book(book, legacy=legacy):
+                print(f"[template] 月度表已就绪: {book}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[template] 月度表准备失败（账号 {a.get('label') or a.get('id')}）: "
+                  f"{type(e).__name__}: {e}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host")
@@ -2642,6 +2719,7 @@ def main():
     print(f"[web] 登录账号 {len(kx.login_accounts(CFG))} 个"
           + ("" if kx.login_accounts(CFG) else "（请先在「账号管理」添加）"))
     app_runtime.cleanup_old_version()
+    _ensure_month_books()
     threading.Thread(target=realtime_scheduler_loop, daemon=True, name="realtime-auto").start()
     print("[auto] 后台自动刷新调度已启动（按配置开关/间隔/时段）")
     if not args.no_browser:

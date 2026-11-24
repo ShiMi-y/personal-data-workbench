@@ -17,6 +17,7 @@ from openpyxl.utils import get_column_letter
 
 import kx_core as kx
 import merge_excel
+import month_table
 
 
 class MergeTestBase(unittest.TestCase):
@@ -26,21 +27,25 @@ class MergeTestBase(unittest.TestCase):
         self._old_data_dir = kx.DATA_DIR
         kx.DATA_DIR = self.root / "data"
         kx.DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self.book = self.root / "月度表.xlsx"
+        self.book = self.root / "快手消耗成交.xlsx"
         self.export = self.root / "export"
         self.export.mkdir()
-        self.cfg = {"excel_path": str(self.book), "auto_backup": False, "backup_limit": 10}
+        self.cfg = {"excel_dir": str(self.root), "auto_backup": False, "backup_limit": 10}
 
     def tearDown(self):
         kx.DATA_DIR = self._old_data_dir
         self.tmp.cleanup()
+
+    def sheet(self):
+        wb = load_workbook(self.book)
+        return wb[month_table.pick_sheet_name(wb)]
 
     def build_book(self, groups, year=2026, month=11, days=30):
         """构造标准月度表：数据行 5..(4+days)，总计行 4+days+1。"""
         total_row = 4 + days + 1
         wb = Workbook()
         ws = wb.active
-        ws.title = merge_excel.SHEET
+        ws.title = f"消耗成交-{year % 100:02d}{month:02d}"
         ws.cell(row=1, column=1, value="日期")
         col = 2
         for name, pid, aid in groups:
@@ -128,7 +133,7 @@ class MergeTests(MergeTestBase):
         self.assertTrue(res["saved"])
         self.assertEqual(res["written"], 1)
         self.assertTrue(all(c["ok"] for c in res["checks"]), res["checks"])
-        ws = load_workbook(self.book)[merge_excel.SHEET]
+        ws = self.sheet()
         self.assertEqual(ws["B7"].value, 100)   # 3 日 -> 第 7 行
         self.assertEqual(ws["C7"].value, 400)
 
@@ -153,7 +158,7 @@ class MergeTests(MergeTestBase):
             [self.prod("2026-10-31", "10000001", "P1001", "商品A", 5, 5)])
         res = self.merge("2026-10-31", "2026-10-31")
         self.assertTrue(res["saved"])
-        ws = load_workbook(self.book)[merge_excel.SHEET]
+        ws = self.sheet()
         self.assertEqual(ws["B35"].value, 5)   # 31 日 -> 第 35 行
         self.assertEqual(ws["B36"].value, "=SUM(B5:B35)")
 
@@ -166,12 +171,17 @@ class MergeTests(MergeTestBase):
         with self.assertRaisesRegex(RuntimeError, "跨月"):
             self.merge("2026-10-30", "2026-11-01")
 
-    def test_table_month_mismatch_is_rejected(self):
+    def test_other_month_creates_new_sheet(self):
         self.build_book([("商品A", "P1001", "10000001")], month=11, days=30)
         self.write_export(
-            [{"date": "2026-10-15", "account_id": "10000001", "cost": 1, "gmv": 1}], [])
-        with self.assertRaisesRegex(RuntimeError, "月份"):
-            self.merge("2026-10-15", "2026-10-15")
+            [{"date": "2026-12-03", "account_id": "10000001", "cost": 1, "gmv": 1}],
+            [self.prod("2026-12-03", "10000001", "P1001", "商品A", 1, 1)])
+        res = self.merge("2026-12-03", "2026-12-03", ["10000001"])
+        self.assertTrue(res["saved"])
+        wb = load_workbook(self.book)
+        self.assertIn("消耗成交-2611", wb.sheetnames)
+        self.assertIn("消耗成交-2612", wb.sheetnames)
+        self.assertEqual(wb["消耗成交-2612"]["B7"].value, 1)
 
     def test_export_failures_block_merge_unless_allowed(self):
         self.build_book([("商品A", "P1001", "10000001")], month=11, days=30)
@@ -195,7 +205,7 @@ class MergeTests(MergeTestBase):
         self.assertTrue(res["saved"])
         self.assertEqual(len(res["added_columns"]), 1)
         self.assertEqual(res["added_columns"][0]["col"], "E")
-        ws = load_workbook(self.book)[merge_excel.SHEET]
+        ws = self.sheet()
         self.assertEqual(ws["E1"].value, "新商品")
         self.assertEqual(ws["E2"].value, "P2001")
         self.assertEqual(ws["E3"].value, "10000009")
@@ -214,7 +224,7 @@ class MergeTests(MergeTestBase):
         self.assertTrue(res["saved"])
         self.assertEqual(res["written"], 1)
         self.assertTrue(any("已留空" in x for x in res["skipped"]))
-        ws = load_workbook(self.book)[merge_excel.SHEET]
+        ws = self.sheet()
         self.assertEqual(ws["B7"].value, 100)
         self.assertIsNone(ws["E7"].value)
 
@@ -236,7 +246,7 @@ class MergeTests(MergeTestBase):
         res = self.merge("2026-10-31", "2026-10-31", ["10000001", "10000009"])
         self.assertTrue(res["saved"])
         self.assertEqual(len(res["added_columns"]), 1)
-        ws = load_workbook(self.book)[merge_excel.SHEET]
+        ws = self.sheet()
         self.assertEqual(ws["B35"].value, 5)
         self.assertEqual(ws["E35"].value, 8)
         self.assertEqual(ws["H36"].value, "=SUM(H5:H35)")
@@ -247,7 +257,7 @@ class SerialDateMonthTests(MergeTestBase):
 
     def use_serial_dates(self, year=2026, month=11, days=30):
         wb = load_workbook(self.book)
-        ws = wb[merge_excel.SHEET]
+        ws = wb[month_table.pick_sheet_name(wb)]
         base = datetime(1899, 12, 30)
         for i in range(days):
             ws.cell(row=merge_excel.FIRST_DATA_ROW + i, column=1,
@@ -265,14 +275,17 @@ class SerialDateMonthTests(MergeTestBase):
         detail = [c["detail"] for c in res["checks"] if c["name"] == "日期行与月份校验"][0]
         self.assertIn("模板月份=2026-11", detail)
 
-    def test_serial_dates_reject_other_month(self):
+    def test_serial_dates_other_month_creates_sheet(self):
         self.build_book([("商品A", "P1001", "10000001")], month=11, days=30)
         self.use_serial_dates()
         self.write_export(
             [{"date": "2026-10-03", "account_id": "10000001", "cost": 1, "gmv": 2}],
             [self.prod("2026-10-03", "10000001", "P1001", "商品A", 1, 2)])
-        with self.assertRaisesRegex(RuntimeError, "不一致"):
-            self.merge("2026-10-03", "2026-10-03")
+        res = self.merge("2026-10-03", "2026-10-03", ["10000001"])
+        self.assertTrue(res["saved"])
+        wb = load_workbook(self.book)
+        self.assertIn("消耗成交-2610", wb.sheetnames)
+        self.assertIn("消耗成交-2611", wb.sheetnames)
 
 
 class NewColumnNamingTests(MergeTestBase):
@@ -293,7 +306,7 @@ class NewColumnNamingTests(MergeTestBase):
               "order_cnt": 1, "roi": 0, "show_cnt": 0, "click_cnt": 0}])
         res = self.merge("2026-11-03", "2026-11-03", ["10000001", "10000009"])
         self.assertTrue(res["saved"])
-        ws = load_workbook(self.book)[merge_excel.SHEET]
+        ws = self.sheet()
         self.assertEqual(ws["E1"].value, "新账户名")
         self.assertEqual(ws["E2"].value, "P2001")
         self.assertEqual(ws["E3"].value, "10000009")
