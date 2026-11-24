@@ -1352,8 +1352,12 @@ def _error_body(e: Exception, limit: int = 400) -> str:
     return " ".join(text.split())
 
 
-def _status_hint(code: int, source: str) -> str:
+def _status_hint(code: int, source: str, body: str = "") -> str:
     dav = source in ("webdav", "webdav_private")
+    low = (body or "").lower()
+    if not dav and (code in (403, 429) and "rate limit" in low):
+        return ("GitHub 接口被限流：未登录时按出口 IP 共享每小时 60 次（同一网络/代理下所有机器一起算）。"
+                "可稍等一小时再试、配置环境变量 GITHUB_TOKEN，或把更新源换成 WebDAV")
     if code in (401, 403):
         return ("认证失败：检查 WebDAV 用户名/密码；私有 WebDAV 还要确认口令与生成时一致"
                 if dav else "认证失败：私有仓库需配置 GITHUB_TOKEN，或 token 没有 repo 权限")
@@ -1391,29 +1395,79 @@ def _github_token() -> str:
     return (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
 
 
+def _update_cache_path() -> Path:
+    return kx.DATA_DIR / "update_cache.json"
+
+
+def _load_update_cache() -> dict:
+    """上次成功的 Release 结果（含 ETag），用于条件请求，避免反复消耗 GitHub 配额"""
+    try:
+        raw = _update_cache_path().read_text(encoding="utf-8")
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_update_cache(payload: dict) -> None:
+    try:
+        path = _update_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception as e:  # noqa: BLE001
+        print(f"[update] 写缓存失败（不影响本次结果）: {type(e).__name__}: {e}")
+
+
+GITHUB_API_BASE = (os.environ.get("PDW_GITHUB_API_BASE") or "https://api.github.com").rstrip("/")
+
+
 def _github_release(cfg: dict) -> dict:
     """取 GitHub 最新 Release（私有仓库可用环境变量 GITHUB_TOKEN）"""
     repo = str(cfg.get("update_repo") or "").strip().strip("/")
     if not repo:
         raise UpdateError("未配置 update_repo（格式：owner/repo）", source="github",
                           hint="在设置里填写 owner/repo，例如 ShiMi-y/personal-data-workbench")
-    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    url = f"{GITHUB_API_BASE}/repos/{repo}/releases/latest"
     token = _github_token()
-    req = urllib.request.Request(
-        url,
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "kuaishou-roi-workbench"},
-    )
+    cache = _load_update_cache()
+    cached_ok = bool(cache.get("body")) and cache.get("url") == url
+    if cached_ok and time.time() - float(cache.get("saved_at") or 0) < 300:
+        print("[update] GitHub 命中本地缓存（5 分钟内已查过），不消耗接口配额")
+        return cache["body"]
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "kuaishou-roi-workbench"}
     if token:
-        req.add_header("Authorization", f"Bearer {token}")
+        headers["Authorization"] = f"Bearer {token}"
+    if cached_ok and cache.get("etag"):
+        headers["If-None-Match"] = cache["etag"]
+    req = urllib.request.Request(url, headers=headers)
     print(f"[update] GitHub 请求: {url} | token={'有' if token else '无'} "
-          f"| 代理={'有' if str(cfg.get('update_proxy') or '').strip() else '无'}")
+          f"| 代理={'有' if str(cfg.get('update_proxy') or '').strip() else '无'}"
+          + (f" | 条件请求 etag={cache['etag'][:18]}…" if headers.get("If-None-Match") else ""))
     started = time.time()
     try:
         with _update_opener(cfg).open(req, timeout=20) as r:
             raw = r.read().decode("utf-8", "replace")
+            etag = r.headers.get("ETag") or ""
+            remain = r.headers.get("X-RateLimit-Remaining")
+            reset = r.headers.get("X-RateLimit-Reset")
+            if remain is not None:
+                print(f"[update] GitHub 配额: 剩余 {remain}" +
+                      (f"，重置时间 {time.strftime('%H:%M:%S', time.localtime(int(reset)))}" if reset else ""))
     except urllib.error.HTTPError as e:
+        if e.code == 304 and cached_ok:
+            print("[update] GitHub 返回 304（内容未变，条件请求不计配额），使用本地缓存")
+            _save_update_cache({"url": url, "etag": cache.get("etag") or "",
+                                "body": cache["body"], "saved_at": time.time()})
+            return cache["body"]
         body = _error_body(e)
-        hint = _status_hint(e.code, "github")
+        hint = _status_hint(e.code, "github", body)
+        remain = e.headers.get("X-RateLimit-Remaining") if getattr(e, "headers", None) else None
+        reset = e.headers.get("X-RateLimit-Reset") if getattr(e, "headers", None) else None
+        if remain is not None:
+            print(f"[update] GitHub 配额: 剩余 {remain}" +
+                  (f"，重置时间 {time.strftime('%H:%M:%S', time.localtime(int(reset)))}" if reset else ""))
         _log_http_failure("GitHub ", url, e.code, str(e.reason), body, hint, time.time() - started, "github")
         raise UpdateError(f"GitHub 返回 HTTP {e.code} {e.reason}" + (f"：{hint}" if hint else ""),
                           source="github", url=_mask_url(url), status=e.code,
@@ -1430,6 +1484,7 @@ def _github_release(cfg: dict) -> dict:
                           source="github", url=_mask_url(url), detail=raw[:400]) from e
     print(f"[update] GitHub 成功: tag={data.get('tag_name')} 资产数={len(data.get('assets') or [])} "
           f"用时 {time.time() - started:.1f}s")
+    _save_update_cache({"url": url, "etag": etag, "body": data, "saved_at": time.time()})
     return data
 
 
