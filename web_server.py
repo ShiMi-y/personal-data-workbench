@@ -1481,6 +1481,39 @@ def _dav_list_dir(conf: dict, url: str, limit: int = 15) -> list[str]:
     return names[:limit] or ["(目录为空或无权限列出)"]
 
 
+def _dav_probe_version(conf: dict, base: str, names: list[str], limit: int = 3) -> list[str]:
+    """在列出的子目录里并发找 version*.json，帮助定位「版本文件放错目录」"""
+    import concurrent.futures as _cf
+    dirs = [n for n in names if "." not in n and not n.startswith("(")][:limit]
+    if not dirs:
+        return []
+
+    def probe(name: str) -> list[str]:
+        url = base.rstrip("/") + "/" + name + "/"
+        try:
+            req = urllib.request.Request(url, method="PROPFIND",
+                                         headers={"Depth": "1", "User-Agent": "kuaishou-roi-workbench"})
+            with _dav_opener(conf).open(req, timeout=6) as r:
+                xml = r.read(300_000).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            return []
+        hits = []
+        for m in re.finditer(r"<[^>]*:?href[^>]*>([^<]+)</[^>]*:?href>", xml):
+            fn = m.group(1).strip().rstrip("/").rsplit("/", 1)[-1]
+            low = fn.lower()
+            if low.endswith(".json") and "version" in low:
+                hits.append(url + fn)
+        return hits
+
+    found: list[str] = []
+    with _cf.ThreadPoolExecutor(max_workers=3) as ex:
+        for hits in ex.map(probe, dirs):
+            for h in hits:
+                if h not in found:
+                    found.append(h)
+    return found[:5]
+
+
 def _dav_release(cfg: dict) -> dict:
     """从 WebDAV 读取 version.json（Digest 认证）"""
     source = str(cfg.get("update_source") or "webdav").lower()
@@ -1508,9 +1541,14 @@ def _dav_release(cfg: dict) -> dict:
             listing = _dav_list_dir(conf, url)
             ok_list = bool(listing) and not listing[0].startswith("(")
             if ok_list:
-                print(f"[update] WebDAV 同目录可见内容（{_mask_url(url.rsplit('/', 1)[0] + '/')}）: "
-                      + ", ".join(listing))
+                base = url.rsplit('/', 1)[0] + '/'
+                print(f"[update] WebDAV 同目录可见内容（{_mask_url(base)}）: " + ", ".join(listing))
                 hint += "；同目录可见：" + ", ".join(listing)
+                found = _dav_probe_version(conf, base, listing)
+                if found:
+                    print("[update] 在子目录找到疑似版本文件: " + ", ".join(_mask_url(x) for x in found))
+                    hint += "；在子目录里找到：" + ", ".join(_mask_url(x) for x in found) \
+                            + "（把「版本文件路径」改成对应路径即可）"
             else:
                 print(f"[update] WebDAV 同目录无法列出: {listing[0] if listing else '空'}")
         raise UpdateError(f"WebDAV 返回 HTTP {e.code} {e.reason}" + (f"：{hint}" if hint else ""),
@@ -2447,6 +2485,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     return self._json(api_update_check())
                 except app_secret.PrivatePassphraseRequired as e:
+                    print("[update] 私有 WebDAV 文件尚未解锁，等待页面输入口令")
                     return self._json({"error": str(e), "need_passphrase": True}, 401)
                 except Exception as e:  # noqa: BLE001
                     ctx = getattr(e, "update_context", None) or {}
