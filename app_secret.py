@@ -173,16 +173,23 @@ def load_private() -> dict | None:
     raise PrivatePassphraseRequired("私有 WebDAV 文件需要口令解锁")
 
 
-def export_private(passphrase: str) -> Path:
-    """把已保存的 WebDAV 连接用口令加密后写入私有文件（可跨设备）"""
+def export_private(passphrase: str, extra: dict | None = None) -> Path:
+    """把已保存的 WebDAV 连接用口令加密后写入私有文件（可跨设备）
+
+    extra 里可附带端口/路径等本机设置（如 update_webdav_path），
+    这样换设备解锁后不必再手工填一遍。
+    """
     global _PRIVATE_CACHE
     if not str(passphrase or "").strip():
         raise ValueError("口令不能为空")
     if not SECRET_PATH.exists():
         raise RuntimeError("还没有可用的 WebDAV 连接，请先在 WebDAV 方式里保存")
-    conf = load_webdav()
+    conf = dict(load_webdav() or {})
     if not conf:
         raise RuntimeError("无法读取本机 WebDAV 连接，请重新保存")
+    for k, v in (extra or {}).items():
+        if v not in (None, ""):
+            conf[k] = v
     salt = os.urandom(16)
     token = _fernet(passphrase, salt).encrypt(
         json.dumps(conf, ensure_ascii=False).encode("utf-8"))

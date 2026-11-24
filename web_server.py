@@ -1486,6 +1486,10 @@ def _dav_release(cfg: dict) -> dict:
     source = str(cfg.get("update_source") or "webdav").lower()
     conf = _dav_conf(source)
     path = str(cfg.get("update_webdav_path") or "/version.json").strip() or "/version.json"
+    bundled = str(conf.get("update_webdav_path") or "").strip()
+    if source == "webdav_private" and bundled and path == "/version.json" and bundled != path:
+        print(f"[update] 私有文件内含版本路径 {bundled}，本机为默认值，按私有文件为准")
+        path = bundled
     url = _dav_url(conf, path)
     opener = _dav_opener(conf)
     req = urllib.request.Request(url, headers={"User-Agent": "kuaishou-roi-workbench"})
@@ -2678,8 +2682,11 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         if not passphrase:
                             raise ValueError("生成私有文件需要设置口令")
-                        app_secret.export_private(passphrase)
-                        print("[webdav] 已生成/更新私有文件 webdav_private.dat（口令加密，可跨设备）")
+                        with CFG_LOCK:
+                            dav_path = str(CFG.get("update_webdav_path") or "/version.json")
+                        app_secret.export_private(passphrase, {"update_webdav_path": dav_path})
+                        print("[webdav] 已生成/更新私有文件 webdav_private.dat（口令加密，可跨设备；"
+                              f"内含版本文件路径 {dav_path}）")
                     return self._json(api_webdav_status())
                 except ValueError as e:
                     return self._json({"error": str(e)}, 400)
