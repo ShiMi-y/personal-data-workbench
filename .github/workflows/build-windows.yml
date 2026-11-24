@@ -92,16 +92,23 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $prevTag = gh release list --limit 10 --json tagName --jq '.[0].tagName' 2>$null
+          $ErrorActionPreference = 'Continue'
+          $prevTag = ''
+          try {
+            $list = gh release list --limit 10 --json tagName | ConvertFrom-Json
+            if ($list) { $prevTag = @($list)[0].tagName }
+          } catch { Write-Host "读取 Release 列表失败: $_" }
+          Write-Host "上一版: $prevTag"
           if ($prevTag) {
             New-Item -ItemType Directory -Force -Path prev | Out-Null
             gh release download $prevTag -p manifest.json -D prev 2>$null
             if (Test-Path 'prev/manifest.json') {
               Add-Content -Path $env:GITHUB_ENV -Value "PREV_MANIFEST=prev/manifest.json" -Encoding ascii
               Add-Content -Path $env:GITHUB_ENV -Value "PREV_VERSION=$($prevTag.TrimStart('v'))" -Encoding ascii
-              Write-Host "上一版: $prevTag（已取到 manifest.json）"
+              Write-Host "已取到上一版 manifest.json"
             } else {
-              Write-Host "上一版 $prevTag 没有 manifest.json，尝试从它的升级包现算一份"
+              Write-Host "上一版没有 manifest.json，尝试从它的升级包现算"
+              Add-Content -Path $env:GITHUB_ENV -Value "PREV_VERSION=$($prevTag.TrimStart('v'))" -Encoding ascii
               gh release download $prevTag -p '*win64.zip' -D prev 2>$null
               $prevZip = Get-ChildItem 'prev' -Filter *.zip -ErrorAction SilentlyContinue | Select-Object -First 1
               if ($prevZip) {
@@ -111,11 +118,12 @@ jobs:
                   Add-Content -Path $env:GITHUB_ENV -Value "PREV_MANIFEST=prev/manifest.json" -Encoding ascii
                   Write-Host "已用上一版升级包生成清单，可产出增量包"
                 }
+              } else {
+                Write-Host "上一版没有 win64.zip，本次只出全量"
               }
             }
-          } else {
-            Write-Host "没有任何已发布版本，本次只出全量"
           }
+          exit 0
 
       - name: Make manifest and delta
         shell: pwsh
