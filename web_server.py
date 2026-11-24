@@ -40,6 +40,7 @@ import kx_core as kx  # noqa: E402
 import merge_excel  # noqa: E402
 import merge_roi  # noqa: E402
 import realtime_history as rt_history  # noqa: E402
+import update_delta as ud  # noqa: E402
 import week_data  # noqa: E402
 
 WEB_DIR = kx.BUNDLE_DIR / "web"  # 打包后页面资源在解包目录
@@ -536,6 +537,7 @@ CONFIG_KEYS = ("headless", "date_offset_days", "page_size",
                "auto_backup", "backup_limit", "version", "update_repo",
                "update_source", "update_webdav_path",
                "update_github_mirror_enabled", "update_github_mirror", "update_proxy",
+               "update_delta_prefer",
                "realtime_auto_refresh", "realtime_interval_minutes",
                "realtime_window_start", "realtime_window_end",
                "realtime_retry_enabled", "realtime_retry_max")
@@ -848,6 +850,8 @@ def api_save_config(body: dict) -> dict:
         if mirror and not re.match(r"^https?://", mirror, re.I):
             raise ValueError("GitHub 镜像地址需以 http:// 或 https:// 开头")
         cfg["update_github_mirror"] = mirror
+    if "update_delta_prefer" in body:
+        cfg["update_delta_prefer"] = bool(body["update_delta_prefer"])
     if "update_proxy" in body:
         proxy = str(body.get("update_proxy") or "").strip()
         if proxy and not re.match(r"^https?://", proxy, re.I):
@@ -1626,12 +1630,22 @@ def _dav_release(cfg: dict) -> dict:
     dl = str(info.get("download") or info.get("url") or "").strip()
     if dl and not dl.startswith("http"):
         dl = f"{path.rsplit('/', 1)[0]}/{dl}"
+    delta = info.get("delta") if isinstance(info.get("delta"), dict) else None
+    if delta:
+        d_dl = str(delta.get("download") or delta.get("url") or "").strip()
+        if d_dl and not d_dl.startswith("http"):
+            d_dl = f"{path.rsplit('/', 1)[0]}/{d_dl}"
+        delta = {"from": str(delta.get("from") or "").strip().lstrip("vV"),
+                 "download": d_dl,
+                 "size": delta.get("size"),
+                 "sha256": str(delta.get("sha256") or "").strip()}
     return {
         "version": str(info.get("version") or "").strip().lstrip("vV"),
         "notes": str(info.get("notes") or "")[:2000],
         "download": dl,
         "size": info.get("size"),
         "sha256": str(info.get("sha256") or "").strip(),
+        "delta": delta,
     }
 
 
@@ -1695,6 +1709,13 @@ def _update_info(cfg: dict) -> dict:
         dl = rel["download"]
         asset = ({"name": dl.rsplit("/", 1)[-1] or "update.zip", "size": rel.get("size"),
                   "url": dl, "sha256": rel.get("sha256") or ""} if dl else None)
+        d = rel.get("delta") or {}
+        delta_asset = None
+        if d.get("download"):
+            delta_asset = {"name": d["download"].rsplit("/", 1)[-1] or "delta.zip",
+                           "size": d.get("size"), "url": d["download"],
+                           "sha256": d.get("sha256") or "",
+                           "from_version": d.get("from") or ""}
         notes = rel["notes"]
         page = ""
         repo = ""
@@ -1703,10 +1724,12 @@ def _update_info(cfg: dict) -> dict:
         latest = str(rel.get("tag_name") or "").strip().lstrip("vV")
         assets = rel.get("assets") or []
         zips = [a for a in assets if str(a.get("name", "")).lower().endswith(".zip")]
+        # 增量包不能当全量包用，先排除
+        full_zips = [a for a in zips if "-delta" not in str(a.get("name", "")).lower()]
         # 多个 zip 时优先 Windows 包（常见命名含 win / 快手）
-        win_zips = [a for a in zips
+        win_zips = [a for a in full_zips
                     if any(k in str(a.get("name", "")) for k in ("win", "Win", "快手"))]
-        pick = (win_zips or zips)[0] if (win_zips or zips) else None
+        pick = (win_zips or full_zips)[0] if (win_zips or full_zips) else None
         asset = None if not pick else {
             "name": pick.get("name"),
             "size": pick.get("size"),
@@ -1714,6 +1737,17 @@ def _update_info(cfg: dict) -> dict:
             # GitHub Release 资产自带 digest（形如 sha256:...）
             "sha256": pick.get("digest") or "",
         }
+        delta_asset = None
+        for a in zips:
+            name = str(a.get("name") or "")
+            if "-delta" not in name.lower():
+                continue
+            m = re.search(r"from-v([0-9A-Za-z._-]+?)-", name)
+            delta_asset = {"name": name, "size": a.get("size"),
+                           "url": a.get("browser_download_url"),
+                           "sha256": a.get("digest") or "",
+                           "from_version": (m.group(1) if m else "")}
+            break
         notes = (rel.get("body") or "")[:2000]
         page = rel.get("html_url") or ""
         repo = str(cfg.get("update_repo") or "")
@@ -1727,6 +1761,7 @@ def _update_info(cfg: dict) -> dict:
         "notes": notes,
         "page_url": page,
         "asset": asset,
+        "delta": delta_asset,
     }
 
 
@@ -2331,8 +2366,62 @@ def _wait_updater_alive(timeout: float = 10.0) -> bool:
     return False
 
 
+def _fetch_update_file(cfg: dict, asset: dict, path: Path, logger, emit, label: str = "升级包") -> int:
+    """下载并校验单个升级文件（支持复用已下载且哈希一致的文件）"""
+    expected_sha = str(asset.get("sha256") or "").strip()
+    if expected_sha:
+        expected_sha = expected_sha.split(":")[-1].strip().lower()
+    try:
+        expected = int(asset.get("size") or 0)
+    except (TypeError, ValueError):
+        expected = 0
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and expected_sha:
+        size_ok = not expected or path.stat().st_size == expected
+        if size_ok and _sha256_file(path) == expected_sha:
+            size = path.stat().st_size
+            logger(f"[update] 复用已下载的{label} {path.name}（{size} 字节）")
+            emit(phase="downloading", downloaded=size, total=size, speed=0,
+                 percent=100, elapsed=0, done=True, reused=True)
+            return size
+
+    path.unlink(missing_ok=True)
+    emit(phase="downloading", downloaded=0, total=expected, speed=0,
+         percent=0 if expected else None, elapsed=0, text=f"正在下载{label}…")
+    _download(cfg, asset["url"], path, logger,
+              on_progress=lambda **kw: emit(phase="downloading", **kw),
+              total_hint=expected)
+    size = path.stat().st_size
+
+    if expected_sha:
+        actual = _sha256_file(path)
+        if actual != expected_sha:
+            path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"{label} SHA256 校验失败（期望 {expected_sha[:12]}…，实际 {actual[:12]}…）")
+        logger(f"[update] {label} SHA256 校验通过")
+    else:
+        logger(f"[update] 警告: {label}未提供 sha256，跳过完整性校验")
+    return size
+
+
+def _extract_full_zip(zip_path: Path, new_dir: Path, size: int, emit, logger) -> None:
+    with zipfile.ZipFile(zip_path) as z:
+        members = z.infolist()
+        total_files = len(members) or 1
+        emit(phase="extracting", extracted=0, total_files=total_files, percent=0,
+             downloaded=size, total=size, text="正在解压升级包…")
+        for i, m in enumerate(members, 1):
+            z.extract(m, new_dir)
+            if i % 40 == 0 or i == total_files:
+                emit(phase="extracting", extracted=i, total_files=total_files,
+                     percent=round(i * 100 / total_files, 1),
+                     downloaded=size, total=size)
+
+
 def stage_update(logger=print, progress=None) -> dict:
-    """检查 + 下载 + 解压升级包（替换由独立升级窗口负责）"""
+    """检查 + 下载 + （增量叠加 / 全量解压）准备新版本目录"""
     def emit(**kw):
         if progress:
             progress(kw)
@@ -2349,62 +2438,48 @@ def stage_update(logger=print, progress=None) -> dict:
     if not asset:
         raise RuntimeError("该 Release 未上传 zip 升级包")
 
-    zip_name = Path(str(asset.get("name") or "update.zip")).name
-    zip_path = UPDATE_DIR / zip_name
-    expected_sha = str(asset.get("sha256") or "").strip()
-    if expected_sha:
-        expected_sha = expected_sha.split(":")[-1].strip().lower()
-    try:
-        expected = int(asset.get("size") or 0)
-    except (TypeError, ValueError):
-        expected = 0
-
-    # 只保留升级脚本/进度/握手文件和本版本安装包，其余（旧的 new/old、他版包）清掉
-    _clean_update_dir({UPDATER_PS1.name, UPDATE_PROGRESS.name,
-                       UPDATER_ALIVE.name, zip_name})
-    UPDATE_DIR.mkdir(parents=True, exist_ok=True)
-
-    reused = False
-    if zip_path.exists() and expected_sha:
-        size_ok = not expected or zip_path.stat().st_size == expected
-        if size_ok and _sha256_file(zip_path) == expected_sha:
-            reused = True
-    if reused:
-        zip_size = zip_path.stat().st_size
-        logger(f"[update] 复用已下载的升级包 {zip_name}（{zip_size} 字节）")
-        emit(phase="downloading", downloaded=zip_size, total=zip_size, speed=0,
-             percent=100, elapsed=0, done=True, reused=True)
-    else:
-        zip_path.unlink(missing_ok=True)
-        emit(phase="downloading", downloaded=0, total=expected, speed=0,
-             percent=0 if expected else None, elapsed=0)
-        _download(cfg, asset["url"], zip_path, logger,
-                  on_progress=lambda **kw: emit(phase="downloading", **kw),
-                  total_hint=expected)
-        zip_size = zip_path.stat().st_size
-
-    if expected_sha:
-        actual_sha = _sha256_file(zip_path)
-        if actual_sha != expected_sha:
-            zip_path.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"升级包 SHA256 校验失败（期望 {expected_sha[:12]}…，实际 {actual_sha[:12]}…）")
-        logger("[update] SHA256 校验通过")
-    else:
-        logger("[update] 警告: 升级包未提供 sha256，跳过完整性校验")
+    delta = info.get("delta") or {}
+    prefer_delta = bool(cfg.get("update_delta_prefer", True))
+    use_delta = bool(prefer_delta and delta.get("url")
+                     and str(delta.get("from_version") or "") == str(info.get("current") or ""))
+    if delta.get("url") and not use_delta:
+        why = "设置里关闭了「优先增量升级」" if not prefer_delta else \
+            f"增量包只适用于 v{delta.get('from_version') or '?'}"
+        logger(f"[update] {why}（当前 v{info['current']}），本次使用全量包")
+    elif not delta.get("url"):
+        logger("[update] 该版本未提供增量包，使用全量包")
 
     new_dir = UPDATE_DIR / "new"
-    with zipfile.ZipFile(zip_path) as z:
-        members = z.infolist()
-        total_files = len(members) or 1
-        emit(phase="extracting", extracted=0, total_files=total_files, percent=0,
-             downloaded=zip_size, total=zip_size)
-        for i, m in enumerate(members, 1):
-            z.extract(m, new_dir)
-            if i % 40 == 0 or i == total_files:
-                emit(phase="extracting", extracted=i, total_files=total_files,
-                     percent=round(i * 100 / total_files, 1),
-                     downloaded=zip_size, total=zip_size)
+    delta_path = UPDATE_DIR / Path(str(delta.get("name") or "delta.zip")).name
+    zip_name = Path(str(asset.get("name") or "update.zip")).name
+    zip_path = UPDATE_DIR / zip_name
+    _clean_update_dir({UPDATER_PS1.name, UPDATE_PROGRESS.name,
+                       UPDATER_ALIVE.name, zip_name, delta_path.name})
+    UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(new_dir, ignore_errors=True)
+
+    used_delta = False
+    if use_delta:
+        try:
+            d_size = _fetch_update_file(cfg, delta, delta_path, logger, emit, label="增量包")
+            emit(phase="extracting", extracted=0, total_files=0, percent=0,
+                 downloaded=d_size, total=d_size, text="正在应用增量更新…")
+            res = ud.apply_delta(kx.BASE, delta_path, new_dir, logger=logger)
+            problems = ud.verify_tree(new_dir, res["manifest"])
+            if problems:
+                raise ud.DeltaNotApplicable("逐文件校验未通过：" + "；".join(problems))
+            logger(f"[update] 增量更新完成：{len(res['manifest'].get('files') or [])} 个文件，"
+                   f"覆盖 {res['overlay']} 个，删除 {res['removed']} 个")
+            used_delta = True
+        except Exception as e:  # noqa: BLE001
+            logger(f"[update] 增量更新不可用（{type(e).__name__}: {e}），自动改用全量包")
+            shutil.rmtree(new_dir, ignore_errors=True)
+            _write_update_progress(phase="downloading", text="增量不可用，正在改用全量包…")
+
+    if not used_delta:
+        size = _fetch_update_file(cfg, asset, zip_path, logger, emit, label="升级包")
+        _extract_full_zip(zip_path, new_dir, size, emit, logger)
+
     root = new_dir
     if not (root / APP_EXE).exists():
         subs = [p for p in new_dir.iterdir() if p.is_dir()]
@@ -2414,10 +2489,11 @@ def stage_update(logger=print, progress=None) -> dict:
         raise RuntimeError("升级包里缺少 exe 或 _internal，已中止")
 
     emit(phase="ready", percent=100, text="升级包已就绪，准备重启…")
-    logger(f"[update] 升级包就绪（v{info['latest']}），即将重启替换")
+    logger(f"[update] {'增量' if used_delta else '全量'}升级已就绪（v{info['latest']}），即将重启替换")
     return {
         "current": info["current"],
         "latest": info["latest"],
+        "mode": "delta" if used_delta else "full",
         "install_dir": str(kx.BASE),
     }
 

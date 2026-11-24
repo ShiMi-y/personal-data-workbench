@@ -1205,6 +1205,10 @@ details.cfgfold summary .hint { margin-top: 0; font-weight: 400; }
             <option value="webdav_private">私有 WebDAV（用程序目录密文文件）</option>
           </select>
         </div>
+        <div class="field wide">
+          <label class="switchline"><input type="checkbox" id="cfgDeltaPrefer" checked /> 优先使用增量升级包</label>
+          <span class="hint" style="margin-top:4px">默认开启：新版本提供匹配当前版本的增量包时，只下载变化文件（通常几 MB），叠加后逐文件校验；不可用或校验失败会自动改用全量包。</span>
+        </div>
         <div class="field wide" id="ghUpdateBox">
           <label>GitHub 仓库 update_repo（owner/repo）</label>
           <input type="text" id="cfgUpdateRepo" placeholder="your-name/personal-data-workbench" />
@@ -1646,6 +1650,7 @@ async function loadConfig() {
     $('#cfgGhMirror').checked = !!c.update_github_mirror_enabled;
     $('#cfgGhMirrorUrl').value = c.update_github_mirror || 'https://ghproxy.net/';
     $('#cfgUpdateProxy').value = c.update_proxy || '';
+    $('#cfgDeltaPrefer').checked = c.update_delta_prefer !== false;
     $('#cfgDavUrl').value = c.webdav_url || '';
     $('#cfgDavUser').value = c.webdav_username || '';
     $('#cfgDavPass').value = '';
@@ -1711,6 +1716,7 @@ async function saveConfig() {
     update_github_mirror_enabled: $('#cfgGhMirror').checked,
     update_github_mirror: $('#cfgGhMirrorUrl').value.trim(),
     update_proxy: $('#cfgUpdateProxy').value.trim(),
+    update_delta_prefer: $('#cfgDeltaPrefer').checked,
     update_webdav_path: $('#cfgDavPath').value.trim(),
     auto_backup: $('#cfgAutoBackup').checked,
     backup_limit: Number($('#cfgBackupLimit').value),

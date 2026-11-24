@@ -87,6 +87,48 @@ jobs:
           $buildArgs += 'web_server.py'
           python -m PyInstaller @buildArgs
 
+      - name: Fetch previous manifest
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $prevTag = gh release list --limit 10 --json tagName --jq '.[0].tagName' 2>$null
+          if ($prevTag) {
+            New-Item -ItemType Directory -Force -Path prev | Out-Null
+            gh release download $prevTag -p manifest.json -D prev 2>$null
+            if (Test-Path 'prev/manifest.json') {
+              Add-Content -Path $env:GITHUB_ENV -Value "PREV_MANIFEST=prev/manifest.json" -Encoding ascii
+              Add-Content -Path $env:GITHUB_ENV -Value "PREV_VERSION=$($prevTag.TrimStart('v'))" -Encoding ascii
+              Write-Host "上一版: $prevTag（已取到 manifest.json）"
+            } else {
+              Write-Host "上一版 $prevTag 没有 manifest.json，尝试从它的升级包现算一份"
+              gh release download $prevTag -p '*win64.zip' -D prev 2>$null
+              $prevZip = Get-ChildItem 'prev' -Filter *.zip -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($prevZip) {
+                Expand-Archive -LiteralPath $prevZip.FullName -DestinationPath 'prev\unz' -Force
+                python tools/make_update_assets.py --dist 'prev\unz' --version $env:PREV_VERSION --out prev --manifest-only
+                if (Test-Path 'prev\manifest.json') {
+                  Add-Content -Path $env:GITHUB_ENV -Value "PREV_MANIFEST=prev/manifest.json" -Encoding ascii
+                  Write-Host "已用上一版升级包生成清单，可产出增量包"
+                }
+              }
+            }
+          } else {
+            Write-Host "没有任何已发布版本，本次只出全量"
+          }
+
+      - name: Make manifest and delta
+        shell: pwsh
+        run: |
+          $deltaName = ""
+          if ($env:PREV_VERSION) { $deltaName = "personal-data-workbench-v$env:APP_VERSION-from-v$env:PREV_VERSION-win64-delta.zip" }
+          $params = @('tools/make_update_assets.py', '--dist', 'dist_ci\快手数据工作台',
+                      '--version', $env:APP_VERSION, '--out', 'release')
+          if ($env:PREV_MANIFEST) {
+            $params += @('--prev-manifest', $env:PREV_MANIFEST, '--prev-version', $env:PREV_VERSION, '--delta-name', $deltaName)
+          }
+          python @params
+
       - name: Create zip
         shell: pwsh
         run: |
@@ -111,10 +153,16 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           $asset = "release\$env:ZIP_NAME"
+          $files = @($asset)
+          if (Test-Path 'release\manifest.json') { $files += 'release\manifest.json' }
+          Get-ChildItem 'release' -Filter *.zip | ForEach-Object {
+            if ($_.Name -ne $env:ZIP_NAME) { $files += $_.FullName }
+          }
+          Write-Host ("上传文件: " + ($files -join ', '))
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $asset --clobber
+            gh release upload $tag $files --clobber
           } else {
-            gh release create $tag $asset --title $tag --generate-notes
+            gh release create $tag $files --title $tag --generate-notes
           }
 
