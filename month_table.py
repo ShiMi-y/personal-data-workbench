@@ -35,7 +35,7 @@ ROI_FORMAT = "0.00_"
 
 
 def sheet_name(year: int, month: int) -> str:
-    return f"{SHEET_PREFIX}-{year % 100:02d}{month:02d}"
+    return f"{year}年{month}月"
 
 
 def detect_month(ws) -> tuple[int | None, int] | None:
@@ -64,12 +64,16 @@ def detect_month(ws) -> tuple[int | None, int] | None:
 
 
 def pick_sheet_name(wb) -> str:
-    """取最新月份的「消耗成交-YYMM」；都没有时退回第一个 sheet"""
-    names = [n for n in wb.sheetnames if n == SHEET_PREFIX or n.startswith(SHEET_PREFIX + "-")]
+    """取最新月份的月度 sheet；兼容「2026年11月」与旧「消耗成交-2611」两种命名"""
+    names = [n for n in wb.sheetnames if re.match(r"^\d{4}年\d{1,2}月$", n)
+             or n == SHEET_PREFIX or n.startswith(SHEET_PREFIX + "-")]
     if not names:
         return wb.sheetnames[0]
 
     def key(n: str):
+        m = re.match(r"^(\d{4})年(\d{1,2})月$", n)
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
         m = re.search(r"-(\d{2})(\d{2})$", n)
         return (2000 + int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
@@ -164,7 +168,42 @@ def ensure_month_sheet(wb, year: int, month: int) -> tuple[object, bool]:
     name = sheet_name(year, month)
     if name in wb.sheetnames:
         return wb[name], False
+    # 兼容旧版固定 sheet：月份一致时直接重命名，保留历史数据
+    if SHEET_PREFIX in wb.sheetnames:
+        ym = detect_month(wb[SHEET_PREFIX])
+        if ym and ym[0] == year and ym[1] == month:
+            wb[SHEET_PREFIX].title = name
+            return wb[name], False
     return create_sheet(wb, year, month), True
+
+
+def _rename_legacy_sheets(path: Path, logger=print) -> None:
+    """把旧版 sheet 名（消耗成交 / 消耗成交-YYMM）统一改成「YYYY年M月」"""
+    try:
+        wb = load_workbook(path)
+    except Exception:  # noqa: BLE001
+        return
+    changed = False
+    try:
+        names = list(wb.sheetnames)
+        for name in names:
+            target = None
+            if name == SHEET_PREFIX:
+                ym = detect_month(wb[name])
+                if ym and ym[0]:
+                    target = sheet_name(ym[0], ym[1])
+            else:
+                m = re.match(r"^" + re.escape(SHEET_PREFIX) + r"-(\d{2})(\d{2})$", name)
+                if m:
+                    target = sheet_name(2000 + int(m.group(1)), int(m.group(2)))
+            if target and target != name and target not in wb.sheetnames:
+                wb[name].title = target
+                changed = True
+                logger(f"[template] 旧 sheet「{name}」已重命名为「{target}」")
+        if changed:
+            wb.save(path)
+    finally:
+        wb.close()
 
 
 def ensure_book(path: Path, legacy: Path | None = None, logger=print) -> bool:
@@ -172,6 +211,7 @@ def ensure_book(path: Path, legacy: Path | None = None, logger=print) -> bool:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
+        _rename_legacy_sheets(path, logger)
         return False
 
     legacy = Path(legacy) if legacy else None

@@ -45,7 +45,7 @@ class MergeTestBase(unittest.TestCase):
         total_row = 4 + days + 1
         wb = Workbook()
         ws = wb.active
-        ws.title = f"消耗成交-{year % 100:02d}{month:02d}"
+        ws.title = month_table.sheet_name(year, month)
         ws.cell(row=1, column=1, value="日期")
         col = 2
         for name, pid, aid in groups:
@@ -179,9 +179,9 @@ class MergeTests(MergeTestBase):
         res = self.merge("2026-12-03", "2026-12-03", ["10000001"])
         self.assertTrue(res["saved"])
         wb = load_workbook(self.book)
-        self.assertIn("消耗成交-2611", wb.sheetnames)
-        self.assertIn("消耗成交-2612", wb.sheetnames)
-        self.assertEqual(wb["消耗成交-2612"]["B7"].value, 1)
+        self.assertIn("2026年11月", wb.sheetnames)
+        self.assertIn("2026年12月", wb.sheetnames)
+        self.assertEqual(wb["2026年12月"]["B7"].value, 1)
 
     def test_export_failures_block_merge_unless_allowed(self):
         self.build_book([("商品A", "P1001", "10000001")], month=11, days=30)
@@ -284,8 +284,8 @@ class SerialDateMonthTests(MergeTestBase):
         res = self.merge("2026-10-03", "2026-10-03", ["10000001"])
         self.assertTrue(res["saved"])
         wb = load_workbook(self.book)
-        self.assertIn("消耗成交-2610", wb.sheetnames)
-        self.assertIn("消耗成交-2611", wb.sheetnames)
+        self.assertIn("2026年10月", wb.sheetnames)
+        self.assertIn("2026年11月", wb.sheetnames)
 
 
 class NewColumnNamingTests(MergeTestBase):

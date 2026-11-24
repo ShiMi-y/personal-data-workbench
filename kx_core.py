@@ -43,7 +43,7 @@ else:
     BUNDLE_DIR = BASE
 
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 PROFILE_DIR = BASE / ".browser_profile"
 PROFILES_DIR = BASE / ".browser_profiles"
 DATA_DIR = BASE / "data"
@@ -319,8 +319,16 @@ def account_excel_dir(acct: dict) -> Path:
 
 
 def month_book_path(acct: dict) -> Path:
-    """月度表文件：每个账号一个，内含按月分的 sheet（消耗成交-YYMM）"""
-    return account_excel_dir(acct) / "快手消耗成交.xlsx"
+    """月度表文件：优先使用账号指定的 Excel 文档；仅给目录时才用默认文件名"""
+    raw = str(acct.get("excel_path") or "").strip()
+    if raw:
+        p = resolve_path(raw)
+        if p.suffix.lower() in (".xlsx", ".xlsm"):
+            return p
+    raw_dir = str(acct.get("excel_dir") or "").strip()
+    if raw_dir:
+        return resolve_path(raw_dir) / "快手消耗成交.xlsx"
+    return DATA_DIR / "月度表" / "快手消耗成交.xlsx"
 
 
 def legacy_excel_path(acct: dict) -> Path | None:

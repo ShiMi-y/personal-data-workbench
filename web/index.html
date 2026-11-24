@@ -1013,12 +1013,12 @@ details.cfgfold summary .hint { margin-top: 0; font-weight: 400; }
         </select>
       </div>
       <div class="field wide">
-        <label>月度表目录（程序自动维护「快手消耗成交.xlsx」）</label>
+        <label>月度 Excel（仅 .xlsx / .xlsm）</label>
         <div style="display:flex;gap:8px">
-          <input type="text" id="accExcelDir" placeholder="D:\path\to\月度表目录" style="flex:1" />
-          <button class="ghost" id="btnPickAccDir">选择目录…</button>
+          <input type="text" id="accExcel" placeholder="D:\path\to\月度表.xlsx" style="flex:1" />
+          <button class="ghost" id="btnPickAccExcel">选择文件…</button>
         </div>
-        <span class="hint">每月自动建 sheet「消耗成交-YYMM」；商品首次导入时自动创建列</span>
+        <span class="hint">每月自动建 sheet「YYYY年M月」；商品首次导入时自动创建列</span>
       </div>
       <div class="field wide">
         <label>核算表路径（退款率 / 盈利，仅 .xlsx / .xlsm）</label>
@@ -2061,8 +2061,7 @@ function openAccountForm(id) {
   $('#accPassword').value = '';
   $('#accPassword').placeholder = a && a.has_password ? '已设置，留空表示不修改' : '留空则仅用登录态';
   $('#accRole').value = a ? a.login_role : 'auto';
-  const excelDir = a ? (a.excel_dir || (a.excel_path ? String(a.excel_path).replace(/[\\/][^\\/]*$/, '') : '')) : '';
-  $('#accExcelDir').value = excelDir;
+  $('#accExcel').value = a ? (a.excel_path || a.excel_book || '') : '';
   $('#accRoiBook').value = a ? (a.roi_book_path || '') : '';
   $('#accEnabled').checked = a ? a.enabled : true;
   $('#accCooldown').value = a ? (a.alert_cooldown_minutes ?? 30) : 30;
@@ -2073,7 +2072,11 @@ function openAccountForm(id) {
 }
 
 async function saveAccount() {
-  const excelDir = $('#accExcelDir').value.trim();
+  const excel = $('#accExcel').value.trim();
+  if (excel && !/\.(xlsx|xlsm)$/i.test(excel)) {
+    $('#accFormHint').textContent = '月度表仅支持 .xlsx / .xlsm';
+    return;
+  }
   const roiBook = $('#accRoiBook').value.trim();
   if (roiBook && !/\.(xlsx|xlsm)$/i.test(roiBook)) {
     $('#accFormHint').textContent = '核算表仅支持 .xlsx / .xlsm';
@@ -2083,7 +2086,7 @@ async function saveAccount() {
     label: $('#accLabel').value.trim(),
     login_account: $('#accLogin').value.trim(),
     login_role: $('#accRole').value,
-    excel_dir: excelDir,
+    excel_path: excel,
     roi_book_path: roiBook,
     enabled: $('#accEnabled').checked,
     alert_cooldown_minutes: Number($('#accCooldown').value),
@@ -2093,8 +2096,8 @@ async function saveAccount() {
   if (state.editingAccount) body.id = state.editingAccount;
   const pw = $('#accPassword').value;
   if (pw) body.password = pw;
-  if (!body.login_account && !body.excel_dir) {
-    $('#accFormHint').textContent = '请至少填写登录手机号或月度表目录';
+  if (!body.login_account && !body.excel_path) {
+    $('#accFormHint').textContent = '请至少填写登录手机号或月度表路径';
     return;
   }
   const btn = $('#btnSaveAccount');
@@ -2799,11 +2802,11 @@ $('#btnCancelAccount').addEventListener('click', () => {
   $('#accFormCard').style.display = 'none';
   state.editingAccount = null;
 });
-$('#btnPickAccDir').addEventListener('click', async (e) => {
+$('#btnPickAccExcel').addEventListener('click', async (e) => {
   const btn = e.currentTarget;
-  $('#accFormHint').textContent = '已打开目录选择框（若没看到，请查看任务栏）';
+  $('#accFormHint').textContent = '已打开文件选择框（若没看到，请查看任务栏）';
   try {
-    const path = await pickDir($('#accExcelDir').value, $('#accExcelDir'), btn);
+    const path = await pickExcelFile($('#accExcel').value, $('#accExcel'), btn);
     $('#accFormHint').textContent = path ? '已选择：' + path : '已取消选择';
   } catch (err) {
     $('#accFormHint').textContent = '选择失败：' + err.message;
