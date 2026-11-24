@@ -2007,6 +2007,7 @@ UPDATER_PS1_TEXT = r"""param(
   [string]$LogPath,
   [string]$Exe = '快手数据工作台.exe',
   [string]$AliveFile,
+  [string]$Manifest,
   [switch]$NoGui
 )
 
@@ -2275,9 +2276,54 @@ $oldInternal = Join-Path $App '_internal.old'
 $newInternal = Join-Path $New '_internal'
 $appExe = Join-Path $App $Exe
 $newExe = Join-Path $New $Exe
+$oldExe = Join-Path $App ($Exe + '.old')
 
 if (-not (Test-Path -LiteralPath $newInternal) -or -not (Test-Path -LiteralPath $newExe)) {
   Show-Failure '升级包不完整（缺少新的 _internal 或 exe）'
+}
+
+function Test-Install([string]$root) {
+  if (-not $Manifest -or -not (Test-Path -LiteralPath $Manifest)) {
+    Write-Log '没有清单文件，跳过安装自检'
+    return $true
+  }
+  try {
+    $m = Get-Content -LiteralPath $Manifest -Raw -Encoding UTF8 | ConvertFrom-Json
+  } catch {
+    Write-Log ('清单读取失败，跳过自检: ' + $_.Exception.Message)
+    return $true
+  }
+  $missing = New-Object System.Collections.ArrayList
+  $sizeBad = New-Object System.Collections.ArrayList
+  $hashBad = New-Object System.Collections.ArrayList
+  $critical = @($Exe, '_internal/python310.dll', '_internal/base_library.zip', '_internal/python3.dll')
+  foreach ($f in $m.files) {
+    $p = Join-Path $root $f.path
+    if (-not (Test-Path -LiteralPath $p)) { [void]$missing.Add($f.path); continue }
+    $len = (Get-Item -LiteralPath $p).Length
+    if ($len -ne [int64]$f.size) { [void]$sizeBad.Add($f.path); continue }
+    if ($critical -contains $f.path) {
+      $h = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLower()
+      if ($h -ne ([string]$f.sha256).ToLower()) { [void]$hashBad.Add($f.path) }
+    }
+  }
+  if ($missing.Count -or $sizeBad.Count -or $hashBad.Count) {
+    Write-Log ('安装自检失败: 缺失 ' + $missing.Count + ' / 大小不符 ' + $sizeBad.Count + ' / 哈希不符 ' + $hashBad.Count)
+    if ($missing.Count) { Write-Log ('缺失: ' + (($missing | Select-Object -First 8) -join ', ')) }
+    if ($sizeBad.Count) { Write-Log ('大小不符: ' + (($sizeBad | Select-Object -First 8) -join ', ')) }
+    if ($hashBad.Count) { Write-Log ('哈希不符: ' + (($hashBad | Select-Object -First 8) -join ', ')) }
+    return $false
+  }
+  Write-Log ('安装自检通过（' + $m.files.Count + ' 个文件）')
+  return $true
+}
+
+function Restore-Old {
+  Write-Log '开始回滚到旧版本'
+  if (Test-Path -LiteralPath $internal) { Remove-WithRetry $internal | Out-Null }
+  if (Test-Path -LiteralPath $oldInternal) { Move-WithRetry $oldInternal $internal | Out-Null }
+  if (Test-Path -LiteralPath $oldExe) { Copy-WithRetry $oldExe $appExe | Out-Null }
+  Write-Log '回滚完成'
 }
 
 Set-Stage '4/4 替换程序文件' '正在替换程序文件…' 1000
@@ -2285,6 +2331,11 @@ Set-Stage '4/4 替换程序文件' '正在替换程序文件…' 1000
 if (Test-Path -LiteralPath $oldInternal) {
   Write-Log '清理残留 _internal.old'
   if (-not (Remove-WithRetry $oldInternal)) { Show-Failure '无法删除 _internal.old（可能仍有进程占用）' }
+}
+
+if (Test-Path -LiteralPath $appExe) {
+  if (Test-Path -LiteralPath $oldExe) { Remove-WithRetry $oldExe | Out-Null }
+  if (Copy-WithRetry $appExe $oldExe) { Write-Log '已备份旧 exe' } else { Write-Log '警告: 旧 exe 备份失败，回滚将不完整' }
 }
 
 if (Test-Path -LiteralPath $internal) {
@@ -2310,13 +2361,43 @@ if (-not (Copy-WithRetry $newExe $appExe)) {
   Show-Failure '无法替换主程序 exe（可能仍被占用），已回滚旧版本'
 }
 
-Write-Log '替换完成'
+Write-Log '替换完成，开始安装自检'
+Set-Stage '校验文件' '正在校验安装完整性…' 1500
+if (-not (Test-Install $App)) {
+  Restore-Old
+  Show-Failure '升级包不完整或文件被杀毒软件拦截，已回滚到旧版本。请重新下载全量包后再试。'
+}
+
 Set-Stage '升级完成' '正在启动新版本…' 1000
+$proc = $null
 try {
-  Start-Process -FilePath $appExe -WorkingDirectory $App
-  Write-Log '已启动新版本'
+  $proc = Start-Process -FilePath $appExe -WorkingDirectory $App -PassThru
+  Write-Log ('已启动新版本 pid=' + [string]$proc.Id)
 } catch {
   Write-Log ('启动新版本失败: ' + $_.Exception.Message)
+}
+
+$alive = $false
+if ($null -ne $proc) {
+  $deadline = (Get-Date).AddSeconds(10)
+  while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 500
+    try { $proc.Refresh() } catch { }
+    if ($proc.HasExited) { break }
+  }
+  try { $alive = -not $proc.HasExited } catch { $alive = $false }
+}
+
+if (-not $alive) {
+  Write-Log '新版本启动后未存活，自动回滚'
+  Restore-Old
+  Set-Stage '已回滚' '新版本启动失败，已还原旧版本…' 800
+  try { Start-Process -FilePath $appExe -WorkingDirectory $App } catch { }
+  Start-Sleep -Seconds 2
+  Show-Failure '新版本启动失败，已自动回滚到旧版本（详见 logs\update-*.log）'
+} else {
+  Write-Log '新版本运行正常，升级完成'
+  if (Test-Path -LiteralPath $oldExe) { Remove-WithRetry $oldExe | Out-Null }
 }
 
 Start-Sleep -Seconds 2
@@ -2348,6 +2429,7 @@ def run_updater(ps1: Path, new_root: Path):
         "-App", str(kx.BASE), "-New", str(new_root),
         "-AppPid", str(os.getpid()), "-ProgressFile", str(UPDATE_PROGRESS),
         "-LogPath", str(log_path), "-Exe", APP_EXE, "-AliveFile", str(UPDATER_ALIVE),
+        "-Manifest", str(UPDATE_DIR / "manifest.json"),
     ]
     flags = 0x08000000  # CREATE_NO_WINDOW：DETACHED_PROCESS 会让 powershell 直接退出不执行脚本
     subprocess.Popen(args, creationflags=flags, close_fds=True)
@@ -2454,7 +2536,7 @@ def stage_update(logger=print, progress=None) -> dict:
     zip_name = Path(str(asset.get("name") or "update.zip")).name
     zip_path = UPDATE_DIR / zip_name
     _clean_update_dir({UPDATER_PS1.name, UPDATE_PROGRESS.name,
-                       UPDATER_ALIVE.name, zip_name, delta_path.name})
+                       UPDATER_ALIVE.name, zip_name, delta_path.name, "manifest.json"})
     UPDATE_DIR.mkdir(parents=True, exist_ok=True)
     shutil.rmtree(new_dir, ignore_errors=True)
 
@@ -2470,6 +2552,8 @@ def stage_update(logger=print, progress=None) -> dict:
                 raise ud.DeltaNotApplicable("逐文件校验未通过：" + "；".join(problems))
             logger(f"[update] 增量更新完成：{len(res['manifest'].get('files') or [])} 个文件，"
                    f"覆盖 {res['overlay']} 个，删除 {res['removed']} 个")
+            (UPDATE_DIR / "manifest.json").write_text(
+                json.dumps(res["manifest"], ensure_ascii=False), encoding="utf-8")
             used_delta = True
         except Exception as e:  # noqa: BLE001
             logger(f"[update] 增量更新不可用（{type(e).__name__}: {e}），自动改用全量包")
@@ -2479,6 +2563,15 @@ def stage_update(logger=print, progress=None) -> dict:
     if not used_delta:
         size = _fetch_update_file(cfg, asset, zip_path, logger, emit, label="升级包")
         _extract_full_zip(zip_path, new_dir, size, emit, logger)
+        packed = new_dir / "manifest.json"
+        if packed.is_file():
+            try:
+                shutil.move(str(packed), str(UPDATE_DIR / "manifest.json"))
+                logger("[update] 已取到包内 manifest.json，替换后将做安装自检")
+            except Exception as e:  # noqa: BLE001
+                logger(f"[update] 包内 manifest.json 处理失败（不影响升级）: {e}")
+        else:
+            logger("[update] 升级包里没有 manifest.json，跳过安装自检")
 
     root = new_dir
     if not (root / APP_EXE).exists():

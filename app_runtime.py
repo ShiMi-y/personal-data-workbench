@@ -191,7 +191,7 @@ def quit_app(delay: float = 1.0):
 
 
 def cleanup_old_version():
-    """升级后遗留的 _internal.old（新版本已正常启动才删）"""
+    """升级后遗留的 _internal.old / *.exe.old（新版本已正常启动才删）"""
     def _work():
         time.sleep(5)
         p = app_dir() / "_internal.old"
@@ -200,6 +200,12 @@ def cleanup_old_version():
                 import shutil
                 shutil.rmtree(p, ignore_errors=True)
                 print("[app] 已清理旧版本目录 _internal.old")
+            except Exception:
+                pass
+        for old_exe in app_dir().glob("*.exe.old"):
+            try:
+                old_exe.unlink(missing_ok=True)
+                print(f"[app] 已清理旧版本程序 {old_exe.name}")
             except Exception:
                 pass
 

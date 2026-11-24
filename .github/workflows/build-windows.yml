@@ -156,8 +156,9 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release | Out-Null
-          Compress-Archive -Path "dist_ci\快手数据工作台\快手数据工作台.exe", "dist_ci\快手数据工作台\_internal" `
-            -DestinationPath "release\$env:ZIP_NAME" -CompressionLevel Optimal
+          $zipItems = @("dist_ci\快手数据工作台\快手数据工作台.exe", "dist_ci\快手数据工作台\_internal")
+          if (Test-Path 'release\manifest.json') { $zipItems += 'release\manifest.json' }
+          Compress-Archive -Path $zipItems -DestinationPath "release\$env:ZIP_NAME" -CompressionLevel Optimal
           Get-Item "release\$env:ZIP_NAME" | Select-Object Name, Length
           (Get-FileHash "release\$env:ZIP_NAME" -Algorithm SHA256).Hash
 
