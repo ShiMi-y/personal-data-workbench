@@ -35,7 +35,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller==6.21.0 openpyxl playwright cryptography
+          python -m pip install pyinstaller==6.21.0 openpyxl playwright cryptography xlrd
 
       - name: Resolve version
         shell: pwsh
@@ -76,6 +76,7 @@ jobs:
             '--distpath','dist_ci','--workpath','build_ci',
             '--add-data','web;web',
             '--add-data','config.example.json;.',
+            '--hidden-import','xlrd',
             '--exclude-module','PIL','--exclude-module','pandas','--exclude-module','matplotlib',
             '--exclude-module','tkinter','--exclude-module','numpy','--exclude-module','lxml',
             '--exclude-module','charset_normalizer'
