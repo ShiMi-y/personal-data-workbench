@@ -216,7 +216,7 @@ CI：推送 `v*` tag 触发 `.github/workflows/build-windows.yml`，自动完成
 ## 发版
 
 1. 三处版本号保持一致：`kx_core.py` 的 `APP_VERSION`、`config.example.json` 的 `version`、`assets/release-version.txt`；
-2. 提交后打 tag 并推送：`git tag v1.5.5 && git push origin v1.5.5`；
+2. 提交后打 tag 并推送：`git tag v<新版本> && git push origin v<新版本>`；
 3. CI 构建完成后，把草稿 Release 转为正式发布（资产：全量包、增量包、`manifest.json`）。
 
 版本号规则、发布前检查清单与脱敏要求见 [`发布规则.md`](发布规则.md)。
