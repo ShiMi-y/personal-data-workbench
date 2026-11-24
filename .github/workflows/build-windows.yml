@@ -91,12 +91,16 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
         run: |
           $ErrorActionPreference = 'Continue'
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           $prevTag = ''
           try {
-            $list = gh release list --limit 10 --json tagName | ConvertFrom-Json
-            if ($list) { $prevTag = @($list)[0].tagName }
+            $list = gh release list --limit 20 --json tagName,isDraft | ConvertFrom-Json
+            $cand = @($list) | Where-Object { -not $_.isDraft -and $_.tagName -ne "v$env:APP_VERSION" }
+            if ($cand) { $prevTag = @($cand)[0].tagName }
           } catch { Write-Host "读取 Release 列表失败: $_" }
           Write-Host "上一版: $prevTag"
           if ($prevTag) {
@@ -127,6 +131,9 @@ jobs:
 
       - name: Make manifest and delta
         shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
         run: |
           $deltaName = ""
           if ($env:PREV_VERSION) { $deltaName = "personal-data-workbench-v$env:APP_VERSION-from-v$env:PREV_VERSION-win64-delta.zip" }

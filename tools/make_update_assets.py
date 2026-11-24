@@ -18,6 +18,13 @@ import json
 import sys
 from pathlib import Path
 
+# Windows 控制台默认不是 UTF-8，先把输出流切到 UTF-8，避免中文日志抛 UnicodeEncodeError
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import update_delta as ud  # noqa: E402
