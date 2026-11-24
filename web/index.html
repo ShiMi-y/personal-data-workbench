@@ -777,6 +777,51 @@ details.cfgfold summary .hint { margin-top: 0; font-weight: 400; }
   .formgrid { grid-template-columns: 1fr; }
   .card h2 { font-size: 13.5px; }
 }
+
+/* ---------------- 实时数据走势（原生 SVG，无第三方依赖） ---------------- */
+.card h2 .h2tools { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
+.chartseg { display: inline-flex; border: 1px solid var(--ks-line); border-radius: 6px; overflow: hidden; background: #fff; }
+.chartseg button { height: 26px; padding: 0 11px; border: 0; background: transparent; color: var(--ks-ink-2);
+  font-size: 12.5px; line-height: 1; cursor: pointer; transition: background .15s, color .15s; }
+.chartseg button + button { border-left: 1px solid var(--ks-line); }
+.chartseg button:hover:not(.on) { background: #f6f8fb; }
+.chartseg button.on { background: var(--ks-brand-soft); color: var(--ks-brand-deep); font-weight: 600; }
+.chartsel { height: 28px; max-width: 230px; padding: 0 26px 0 9px; border: 1px solid var(--ks-line);
+  border-radius: 6px; background: #fff url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%237b8798' stroke-width='1.4' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 9px center;
+  color: var(--ks-ink-2); font-size: 12.5px; appearance: none; cursor: pointer; }
+.chartsel:hover { border-color: var(--ks-brand); }
+.chartsel:focus { outline: none; border-color: var(--ks-brand); box-shadow: 0 0 0 3px rgba(64, 158, 255, .12); }
+.chartbox { position: relative; height: 320px; margin-top: 4px; }
+.chartbox svg { display: block; width: 100%; height: 100%; }
+.chart-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: var(--ks-ink-3); font-size: 13px; }
+.chart-tip { position: absolute; left: 0; top: 6px; z-index: 3; pointer-events: none; opacity: 0;
+  transform: translate(-50%, 0); background: rgba(16, 24, 40, .95); color: #fff; border-radius: 8px;
+  padding: 8px 10px; font-size: 12px; line-height: 1.65; white-space: nowrap;
+  box-shadow: 0 10px 24px rgba(16, 24, 40, .22); transition: opacity .12s; }
+.chart-tip .tt-h { font-weight: 600; margin-bottom: 3px; }
+.chart-tip .tt-r { display: flex; align-items: center; gap: 6px; }
+.chart-tip .tt-r i { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; }
+.chart-tip .tt-r span { color: #d0d5dd; }
+.chart-tip .tt-r b { margin-left: auto; padding-left: 12px; font-variant-numeric: tabular-nums; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 8px; margin-top: 10px; }
+.legend .lg { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 9px 0 8px;
+  border: 1px solid var(--ks-line); border-radius: 999px; background: #fff; font-size: 12px;
+  color: var(--ks-ink-2); cursor: pointer; transition: opacity .15s, border-color .15s; }
+.legend .lg:hover { border-color: var(--ks-brand); }
+.legend .lg i { width: 8px; height: 8px; border-radius: 50%; background: var(--c); flex: 0 0 auto; }
+.legend .lg b { font-weight: 500; }
+.legend .lg small { color: var(--ks-ink-3); }
+.legend .lg.off { opacity: .42; }
+.legend .lg.off i { background: var(--ks-ink-4); }
+@media (max-width: 860px) {
+  .chartbox { height: 240px; }
+  .card h2 { flex-wrap: wrap; }
+  .card h2 .h2tools { order: 4; margin-left: 0; flex-basis: 100%; margin-top: 8px; flex-wrap: wrap; }
+  .card h2 .hint { order: 5; flex-basis: 100%; margin: 6px 0 0; }
+  .chartsel { max-width: 100%; flex: 1 1 150px; }
+}
+
 </style>
 </head>
 <body>
@@ -875,6 +920,31 @@ details.cfgfold summary .hint { margin-top: 0; font-weight: 400; }
     <div id="alertBanner" class="alertbanner"></div>
     <div id="rtBody"><div class="empty">点击「更新实时数据」获取当日（今天）数据</div></div>
     <div class="hint">最后一列可填账户消耗预警线（元），留空或 0 表示不预警；修改后自动保存，超线会标红并弹通知。</div>
+  </section>
+
+  <section class="card" id="rtChartCard">
+    <h2>账户走势
+      <span class="hint" id="rtHistBadge" style="margin:0">尚未记录</span>
+      <span class="h2tools">
+        <span class="chartseg" id="rtDimSeg" role="group" aria-label="时间维度">
+          <button type="button" data-dim="day" class="on">日</button>
+          <button type="button" data-dim="week">周</button>
+          <button type="button" data-dim="month">月</button>
+        </span>
+        <select class="chartsel" id="rtRangeSel" aria-label="时间区间"></select>
+        <span class="chartseg" id="rtMetricSeg" role="group" aria-label="指标">
+          <button type="button" data-metric="cost" class="on">消耗</button>
+          <button type="button" data-metric="gmv">成交</button>
+        </span>
+      </span>
+    </h2>
+    <div class="chartbox" id="rtChartBox">
+      <div class="chart-empty" id="rtChartEmpty">暂无历史记录，点一次「更新实时数据」即可开始留痕</div>
+      <svg id="rtChartSvg" role="img" aria-label="各账号走势折线图"></svg>
+      <div class="chart-tip" id="rtChartTip"></div>
+    </div>
+    <div class="legend" id="rtChartLegend"></div>
+    <div class="hint" id="rtChartHint">每次「更新实时数据」都会自动留痕；日 / 周 / 月按当天最后一次快照汇总，每个账号一条线，点图例可隐藏账号。</div>
   </section>
   </section>
 
@@ -1296,6 +1366,9 @@ details.cfgfold summary .hint { margin-top: 0; font-weight: 400; }
     if (!opts || opts.hash !== false) {
       if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
     }
+    try {
+      document.dispatchEvent(new CustomEvent('panel:shown', { detail: { name: name } }));
+    } catch (e) { /* 忽略 */ }
   }
 
   navItems().forEach(function (b) {
@@ -1902,6 +1975,18 @@ async function sideCheckUpdate() {
     }
   } catch (e) {
     setSideUpdate('检查更新', false, false, '检查失败：' + e.message);
+    const d = (e.data && e.data.update_error) || null;
+    if (d) {
+      const lines = [
+        '更新源：' + (d.source || '-'),
+        '地址：' + (d.url || '-'),
+        '状态：' + (d.status || '-'),
+      ];
+      if (d.hint) lines.push('可能原因：' + d.hint);
+      if (d.detail) lines.push('服务端返回：' + String(d.detail).slice(0, 200));
+      lines.push('', '以上信息已写入 logs/app-<日期>.log，搜索 [update] 可查看完整记录。');
+      uiAlert(lines.join('\n'), { title: '检查更新失败' });
+    }
   }
 }
 
@@ -3120,5 +3205,348 @@ loadState().catch((e) => {
     </div>
   </div>
 </div>
+
+<script>
+/* 实时数据走势图：原生 SVG 折线，每个账号一条线，支持日 / 周 / 月与消耗 / 成交切换 */
+(function () {
+  var box = document.getElementById('rtChartBox');
+  var svg = document.getElementById('rtChartSvg');
+  var tip = document.getElementById('rtChartTip');
+  var legend = document.getElementById('rtChartLegend');
+  var emptyEl = document.getElementById('rtChartEmpty');
+  var hintEl = document.getElementById('rtChartHint');
+  var badge = document.getElementById('rtHistBadge');
+  var dimSeg = document.getElementById('rtDimSeg');
+  var metricSeg = document.getElementById('rtMetricSeg');
+  var rangeSel = document.getElementById('rtRangeSel');
+  if (!box || !svg || !dimSeg || !metricSeg) return;
+
+  var PALETTE = ['#409eff', '#12b76a', '#f79009', '#7a5af8', '#06aed4', '#f04438',
+                 '#b54708', '#0e9384', '#d444f1', '#2e90fa', '#669f2a', '#ee46bc'];
+  var dim = 'day', metric = 'cost', scope = 'recent', anchor = '';
+  var data = null, hidden = {}, lastLoad = 0, timer = null;
+
+  function esc(v) {
+    return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function fmtAxis(v) {
+    if (v >= 1e8) return (v / 1e8).toFixed(v % 1e8 ? 1 : 0) + '亿';
+    if (v >= 1e4) return (v / 1e4).toFixed(v % 1e4 ? 1 : 0) + '万';
+    return String(Math.round(v));
+  }
+  function fmtVal(v) {
+    return Number(v || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  function niceMax(v) {
+    if (!v || v <= 0) return 1;
+    var p = Math.pow(10, Math.floor(Math.log10(v)));
+    var n = v / p;
+    var m = n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10;
+    return m * p;
+  }
+  function colorOf(key) {
+    var idx = 0;
+    if (data) {
+      for (var i = 0; i < data.series.length; i++) { if (data.series[i].key === key) { idx = i; break; } }
+    }
+    return PALETTE[idx % PALETTE.length];
+  }
+
+  var WEEK_CN = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+  function md(dt) {
+    return ('0' + (dt.getMonth() + 1)).slice(-2) + '-' + ('0' + dt.getDate()).slice(-2);
+  }
+  function mondayOf(dt) {
+    var d = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
+    d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+    return d;
+  }
+  function isoOf(dt) {
+    return dt.getFullYear() + '-' + ('0' + (dt.getMonth() + 1)).slice(-2) + '-' + ('0' + dt.getDate()).slice(-2);
+  }
+  function buildRangeOptions() {
+    if (!rangeSel) return;
+    var keep = rangeSel.value || 'recent';
+    var avail = (data && data.available) || { days: [], weeks: [], months: [] };
+    var now = new Date();
+    var html = '';
+    if (dim === 'day') {
+      html += '<option value="recent">最近24小时</option>';
+      html += '<option value="period">今天（' + md(now) + '）</option>';
+      if (avail.days.length) {
+        html += '<optgroup label="选择日期（有留痕）">';
+        avail.days.forEach(function (d) {
+          var wd = WEEK_CN[new Date(d.key + 'T00:00:00').getDay()];
+          html += '<option value="date:' + d.key + '">' + d.key + '（' + wd + '）</option>';
+        });
+        html += '</optgroup>';
+      }
+    } else if (dim === 'week') {
+      html += '<option value="recent">最近7天</option>';
+      html += '<option value="period">本周（' + md(mondayOf(now)) + ' 起）</option>';
+      if (avail.weeks.length) {
+        html += '<optgroup label="选择周（周一起）">';
+        avail.weeks.forEach(function (w) {
+          var start = new Date(w.key + 'T00:00:00');
+          var end = new Date(start.getTime() + 6 * 86400000);
+          html += '<option value="date:' + w.key + '">' + md(start) + ' ~ ' + md(end) + '</option>';
+        });
+        html += '</optgroup>';
+      }
+    } else {
+      html += '<option value="recent">最近31天</option>';
+      html += '<option value="period">本月（' + now.getFullYear() + '年' + (now.getMonth() + 1) + '月）</option>';
+      if (avail.months.length) {
+        html += '<optgroup label="选择月份">';
+        avail.months.forEach(function (m) {
+          html += '<option value="month:' + m.key + '">' + m.label + '</option>';
+        });
+        html += '</optgroup>';
+      }
+    }
+    rangeSel.innerHTML = html;
+    var exists = false;
+    for (var i = 0; i < rangeSel.options.length; i++) {
+      if (rangeSel.options[i].value === keep) { exists = true; break; }
+    }
+    rangeSel.value = exists ? keep : 'recent';
+    applyRange();
+  }
+  function applyRange() {
+    var v = rangeSel ? rangeSel.value : 'recent';
+    if (v === 'recent') { scope = 'recent'; anchor = ''; }
+    else if (v === 'period') { scope = 'period'; anchor = ''; }
+    else if (v.indexOf('date:') === 0) { scope = 'period'; anchor = v.slice(5); }
+    else if (v.indexOf('month:') === 0) { scope = 'period'; anchor = v.slice(6); }
+    else { scope = 'recent'; anchor = ''; }
+  }
+
+  function paint() {
+    var buckets = (data && data.buckets) || [];
+    var series = (data && data.series) || [];
+    var hasData = buckets.length > 0 && series.length > 0;
+    svg.innerHTML = '';
+    legend.innerHTML = '';
+    tip.style.opacity = 0;
+    emptyEl.style.display = hasData ? 'none' : 'flex';
+    if (!hasData) {
+      badge.textContent = '暂无记录';
+      return;
+    }
+    badge.textContent = '已留痕 ' + data.days + ' 天 · ' + data.records + ' 次';
+
+    var W = box.clientWidth || 900;
+    var H = box.clientHeight || 320;
+    var L = 56, R = 20, T = 16, B = 30;
+    var iw = Math.max(60, W - L - R), ih = Math.max(50, H - T - B);
+    svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+
+    var visible = series.filter(function (s) { return !hidden[s.key]; });
+    var maxV = 0;
+    visible.forEach(function (s) {
+      s.values.forEach(function (v) { if (v != null && v > maxV) maxV = v; });
+    });
+    var top = niceMax(maxV || 1);
+    var stepX = buckets.length > 1 ? iw / (buckets.length - 1) : 0;
+    function X(i) { return buckets.length > 1 ? L + i * stepX : L + iw / 2; }
+    function Y(v) { return T + ih - (Math.max(0, v) / top) * ih; }
+
+    var parts = [];
+    for (var k = 0; k <= 4; k++) {
+      var gv = top * k / 4, gy = Y(gv);
+      parts.push('<line x1="' + L + '" y1="' + gy.toFixed(1) + '" x2="' + (L + iw) + '" y2="' + gy.toFixed(1) +
+                 '" stroke="' + (k ? '#eef1f6' : '#d8dee8') + '" stroke-width="1"/>');
+      parts.push('<text x="' + (L - 10) + '" y="' + (gy + 4).toFixed(1) +
+                 '" text-anchor="end" font-size="11" fill="#7b8798">' + fmtAxis(gv) + '</text>');
+    }
+    var labMax = W < 480 ? 5 : 9;
+    var labStep = Math.max(1, Math.ceil(buckets.length / labMax));
+    buckets.forEach(function (b, i) {
+      if (i % labStep && i !== buckets.length - 1) return;
+      parts.push('<text x="' + X(i).toFixed(1) + '" y="' + (T + ih + 18) +
+                 '" text-anchor="middle" font-size="11" fill="#7b8798">' + esc(b.label) + '</text>');
+    });
+
+    var dotGap = stepX > 26;
+    visible.forEach(function (s) {
+      var color = colorOf(s.key);
+      var d = '', started = false;
+      s.values.forEach(function (v, i) {
+        if (v == null) { started = false; return; }
+        d += (started ? 'L' : 'M') + X(i).toFixed(1) + ' ' + Y(v).toFixed(1) + ' ';
+        started = true;
+      });
+      if (!d) return;
+      parts.push('<path d="' + d.trim() + '" fill="none" stroke="' + color + '" stroke-width="2" ' +
+                 'stroke-linejoin="round" stroke-linecap="round" opacity="' + (visible.length > 6 ? 0.85 : 1) + '"/>');
+      if (dotGap && buckets.length <= 40) {
+        s.values.forEach(function (v, i) {
+          if (v == null) return;
+          parts.push('<circle cx="' + X(i).toFixed(1) + '" cy="' + Y(v).toFixed(1) + '" r="2.4" fill="#fff" stroke="' +
+                     color + '" stroke-width="1.6"/>');
+        });
+      }
+    });
+    parts.push('<g id="rtHover" style="display:none"><line y1="' + T + '" y2="' + (T + ih) +
+               '" stroke="#b9c3d2" stroke-dasharray="3 3"/><g id="rtHoverDots"></g></g>');
+    parts.push('<rect id="rtHit" x="' + L + '" y="' + T + '" width="' + iw + '" height="' + ih +
+               '" fill="transparent" style="cursor:crosshair"/>');
+    svg.innerHTML = parts.join('');
+
+    var hover = svg.querySelector('#rtHover');
+    var hoverLine = hover.querySelector('line');
+    var dots = svg.querySelector('#rtHoverDots');
+    var hit = svg.querySelector('#rtHit');
+
+    function move(ev) {
+      var rect = svg.getBoundingClientRect();
+      var px = (ev.clientX - rect.left) * (W / rect.width);
+      var idx = stepX ? Math.round((px - L) / stepX) : 0;
+      idx = Math.max(0, Math.min(buckets.length - 1, idx));
+      hover.style.display = '';
+      hoverLine.setAttribute('x1', X(idx)); hoverLine.setAttribute('x2', X(idx));
+      var rows = [];
+      visible.forEach(function (s) {
+        var v = s.values[idx];
+        if (v == null) return;
+        rows.push({ name: s.name, owner: s.owner, v: v, color: colorOf(s.key) });
+      });
+      rows.sort(function (a, b) { return b.v - a.v; });
+      var circ = rows.slice(0, 10).map(function (r) {
+        var v = r.v;
+        return '<circle cx="' + X(idx).toFixed(1) + '" cy="' + Y(v).toFixed(1) +
+               '" r="3.2" fill="#fff" stroke="' + r.color + '" stroke-width="2"/>';
+      }).join('');
+      dots.innerHTML = circ;
+      var html = '<div class="tt-h">' + esc(buckets[idx].label) + '</div>';
+      if (!rows.length) {
+        html += '<div class="tt-r"><span>该时段无记录</span></div>';
+      } else {
+        html += rows.slice(0, 8).map(function (r) {
+          return '<div class="tt-r"><i style="background:' + r.color + '"></i><span>' + esc(r.name) +
+                 '</span><b>' + fmtVal(r.v) + '</b></div>';
+        }).join('');
+        if (rows.length > 8) {
+          html += '<div class="tt-r"><span>…另有 ' + (rows.length - 8) + ' 个账号</span></div>';
+        }
+      }
+      tip.innerHTML = html;
+      tip.style.opacity = 1;
+      var pct = Math.max(6, Math.min(94, X(idx) / W * 100));
+      tip.style.left = pct + '%';
+    }
+    hit.addEventListener('mousemove', move);
+    hit.addEventListener('mouseleave', function () {
+      hover.style.display = 'none';
+      tip.style.opacity = 0;
+    });
+
+    series.forEach(function (s) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'lg' + (hidden[s.key] ? ' off' : '');
+      b.style.setProperty('--c', colorOf(s.key));
+      var ownerTxt = (s.owner && s.name.indexOf(s.owner) !== 0) ? '<small>· ' + esc(s.owner) + '</small>' : '';
+      b.innerHTML = '<i></i><b>' + esc(s.name) + '</b>' + ownerTxt;
+      b.title = hidden[s.key] ? '点击显示该账号' : '点击隐藏该账号';
+      b.addEventListener('click', function () {
+        if (hidden[s.key]) delete hidden[s.key]; else hidden[s.key] = 1;
+        paint();
+      });
+      legend.appendChild(b);
+    });
+  }
+
+  function load(force) {
+    var now = Date.now();
+    if (!force && now - lastLoad < 900) return;
+    lastLoad = now;
+    var qs = '/api/realtime/history?dim=' + encodeURIComponent(dim)
+      + '&metric=' + encodeURIComponent(metric)
+      + '&scope=' + encodeURIComponent(scope)
+      + (anchor ? '&anchor=' + encodeURIComponent(anchor) : '');
+    fetch(qs)
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (res) {
+        if (!res.ok || res.j.error) throw new Error((res.j && res.j.error) || '读取失败');
+        data = res.j;
+        window.__rtChartData = data;
+        buildRangeOptions();
+        var alive = {};
+        (data.series || []).forEach(function (s) { if (hidden[s.key]) alive[s.key] = 1; });
+        hidden = alive;
+        hintEl.textContent = '每次「更新实时数据」都会自动留痕；日按小时累计、周从周一算起，每个账号一条线，点图例可隐藏账号。'
+          + (data.updated_at ? '（读取于 ' + data.updated_at + '）' : '');
+        paint();
+      })
+      .catch(function (e) {
+        emptyEl.style.display = 'flex';
+        emptyEl.textContent = '历史走势读取失败：' + e.message;
+        hintEl.textContent = '若刚升级到本版本，需要先成功拉取一次实时数据才会产生留痕。';
+      });
+  }
+  function schedule(force) {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(function () { load(force !== false); }, 350);
+  }
+
+  dimSeg.addEventListener('click', function (ev) {
+    var b = ev.target.closest ? ev.target.closest('button') : null;
+    if (!b || !b.dataset.dim) return;
+    Array.prototype.forEach.call(dimSeg.querySelectorAll('button'), function (x) {
+      x.classList.toggle('on', x === b);
+    });
+    dim = b.dataset.dim;
+    scope = 'recent'; anchor = '';
+    if (rangeSel) rangeSel.value = 'recent';
+    buildRangeOptions();
+    load(true);
+  });
+  if (rangeSel) {
+    rangeSel.addEventListener('change', function () {
+      applyRange();
+      load(true);
+    });
+  }
+  metricSeg.addEventListener('click', function (ev) {
+    var b = ev.target.closest ? ev.target.closest('button') : null;
+    if (!b || !b.dataset.metric) return;
+    Array.prototype.forEach.call(metricSeg.querySelectorAll('button'), function (x) {
+      x.classList.toggle('on', x === b);
+    });
+    metric = b.dataset.metric;
+    load(true);
+  });
+
+  var resizeTimer = null;
+  window.addEventListener('resize', function () {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () { if (data) paint(); }, 200);
+  });
+
+  // 面板切回来时重绘（隐藏期间宽度为 0，无法计算坐标）
+  document.addEventListener('panel:shown', function (ev) {
+    if (ev.detail && ev.detail.name === 'realtime') { if (data) paint(); else load(true); }
+  });
+
+  // 每次实时抓取结束（renderRealtime 被调用）后刷新曲线
+  var origRender = window.renderRealtime;
+  if (typeof origRender === 'function') {
+    window.renderRealtime = function () {
+      var out = origRender.apply(this, arguments);
+      schedule(true);
+      return out;
+    };
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function () { load(true); });
+  } else {
+    load(true);
+  }
+})();
+</script>
 </body>
 </html>

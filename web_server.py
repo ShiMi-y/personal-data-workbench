@@ -39,6 +39,7 @@ import export_syt  # noqa: E402
 import kx_core as kx  # noqa: E402
 import merge_excel  # noqa: E402
 import merge_roi  # noqa: E402
+import realtime_history as rt_history  # noqa: E402
 import week_data  # noqa: E402
 
 WEB_DIR = kx.BUNDLE_DIR / "web"  # 打包后页面资源在解包目录
@@ -731,6 +732,10 @@ def collect_realtime(cfg: dict, owners: list[dict] | None = None, logger=print,
             "alerts": alerts,
         }
         kx.save_realtime_cache(combined)
+        try:
+            rt_history.record(kx.DATA_DIR, combined)
+        except Exception as e:  # noqa: BLE001
+            logger(f"[实时] 历史留痕写入失败（不影响本次结果）: {type(e).__name__}: {e}")
         _notify_alerts(alerts, cfg, logger=logger)
         return combined
     finally:
@@ -1301,6 +1306,86 @@ def _ver_tuple(v) -> tuple:
     return tuple(int(n) for n in nums[:6]) or (0,)
 
 
+# ---------------------------------------------------------------------------
+# 更新检查：统一错误上下文与日志
+# 目标：失败时日志里能直接看到「哪个地址、什么状态码、服务端返回了什么」，
+# 便于事后排查（尤其是私有 WebDAV 路径写错、跨设备网络不通、GitHub 私有仓库缺 token）。
+# ---------------------------------------------------------------------------
+class UpdateError(RuntimeError):
+    """带上下文的更新检查失败（source/url/status/detail/hint）"""
+
+    def __init__(self, message: str, *, source: str = "", url: str = "", status: int = 0,
+                 detail: str = "", hint: str = ""):
+        super().__init__(message)
+        self.update_context = {
+            "source": source,
+            "url": url,
+            "status": status,
+            "detail": detail,
+            "hint": hint,
+        }
+
+
+def _mask_url(url: str) -> str:
+    """日志里隐藏 URL 中的账号密码与查询串里的敏感值"""
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        sp = urlsplit(str(url))
+        netloc = sp.netloc
+        if "@" in netloc:
+            netloc = "***@" + netloc.split("@", 1)[1]
+        return urlunsplit((sp.scheme, netloc, sp.path, sp.query, ""))
+    except Exception:  # noqa: BLE001
+        return str(url)
+
+
+def _error_body(e: Exception, limit: int = 400) -> str:
+    """读取 HTTPError 响应体（WebDAV 多为 XML，GitHub 为 JSON），压成一行"""
+    try:
+        raw = e.read()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        text = raw[:limit].decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return ""
+    return " ".join(text.split())
+
+
+def _status_hint(code: int, source: str) -> str:
+    dav = source in ("webdav", "webdav_private")
+    if code in (401, 403):
+        return ("认证失败：检查 WebDAV 用户名/密码；私有 WebDAV 还要确认口令与生成时一致"
+                if dav else "认证失败：私有仓库需配置 GITHUB_TOKEN，或 token 没有 repo 权限")
+    if code == 404:
+        if dav:
+            return ("404 = 该地址下没有这个文件。版本文件路径保存在各设备自己的 config.json 里，"
+                    "换设备后可能不同；请核对「版本文件路径」与 WebDAV 上的实际文件名/目录，"
+                    "并确认这台设备访问的是同一个 WebDAV 站点")
+        return "404 = 仓库或 Release 不存在；私有仓库未配置 token 时 GitHub 同样返回 404"
+    if code == 405:
+        return "405 = 服务端不接受该请求方法，可能填的是普通网页地址而不是 WebDAV 地址"
+    if code == 429:
+        return "429 = 请求太频繁（GitHub 限流），稍后再试"
+    if 500 <= code < 600:
+        return "服务端错误，稍后重试或联系 WebDAV 提供方"
+    return ""
+
+
+def _log_http_failure(where: str, url: str, code: int, reason: str, body: str, hint: str,
+                      elapsed: float, source: str) -> None:
+    print(f"[update] {where}失败: HTTP {code} {reason} | source={source} url={_mask_url(url)} "
+          f"| 用时 {elapsed:.1f}s" + (f" | 提示: {hint}" if hint else ""))
+    if body:
+        print(f"[update] {where}响应体: {body}")
+
+
+def _log_network_failure(where: str, url: str, reason, elapsed: float, source: str) -> str:
+    print(f"[update] {where}网络错误: {reason} | source={source} url={_mask_url(url)} | 用时 {elapsed:.1f}s")
+    return (f"无法连接 {_mask_url(url)}：{reason}"
+            "（检查网络/DNS/代理，跨设备使用时确认该设备能访问同一地址）")
+
+
 def _github_token() -> str:
     """GitHub 访问令牌：优先 GITHUB_TOKEN，兼容 GH_TOKEN"""
     return (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
@@ -1310,16 +1395,42 @@ def _github_release(cfg: dict) -> dict:
     """取 GitHub 最新 Release（私有仓库可用环境变量 GITHUB_TOKEN）"""
     repo = str(cfg.get("update_repo") or "").strip().strip("/")
     if not repo:
-        raise RuntimeError("未配置 update_repo（格式：owner/repo）")
+        raise UpdateError("未配置 update_repo（格式：owner/repo）", source="github",
+                          hint="在设置里填写 owner/repo，例如 ShiMi-y/personal-data-workbench")
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    token = _github_token()
     req = urllib.request.Request(
-        f"https://api.github.com/repos/{repo}/releases/latest",
+        url,
         headers={"Accept": "application/vnd.github+json", "User-Agent": "kuaishou-roi-workbench"},
     )
-    token = _github_token()
     if token:
         req.add_header("Authorization", f"Bearer {token}")
-    with _update_opener(cfg).open(req, timeout=20) as r:
-        return json.loads(r.read().decode("utf-8"))
+    print(f"[update] GitHub 请求: {url} | token={'有' if token else '无'} "
+          f"| 代理={'有' if str(cfg.get('update_proxy') or '').strip() else '无'}")
+    started = time.time()
+    try:
+        with _update_opener(cfg).open(req, timeout=20) as r:
+            raw = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        body = _error_body(e)
+        hint = _status_hint(e.code, "github")
+        _log_http_failure("GitHub ", url, e.code, str(e.reason), body, hint, time.time() - started, "github")
+        raise UpdateError(f"GitHub 返回 HTTP {e.code} {e.reason}" + (f"：{hint}" if hint else ""),
+                          source="github", url=_mask_url(url), status=e.code,
+                          detail=body, hint=hint) from e
+    except urllib.error.URLError as e:
+        msg = _log_network_failure("GitHub ", url, e.reason, time.time() - started, "github")
+        raise UpdateError(msg, source="github", url=_mask_url(url), detail=str(e.reason),
+                          hint="GitHub 直连不稳定时可改用镜像或配置代理") from e
+    try:
+        data = json.loads(raw)
+    except Exception as e:  # noqa: BLE001
+        print(f"[update] GitHub 返回不是 JSON: {raw[:200]!r}")
+        raise UpdateError("GitHub 返回内容不是合法 JSON（可能被代理/镜像拦截）",
+                          source="github", url=_mask_url(url), detail=raw[:400]) from e
+    print(f"[update] GitHub 成功: tag={data.get('tag_name')} 资产数={len(data.get('assets') or [])} "
+          f"用时 {time.time() - started:.1f}s")
+    return data
 
 
 def _dav_conf(source: str = "webdav") -> dict:
@@ -1349,16 +1460,72 @@ def _dav_url(conf: dict, path: str) -> str:
     return base + (path if path.startswith("/") else "/" + path)
 
 
+def _dav_list_dir(conf: dict, url: str, limit: int = 15) -> list[str]:
+    """列 WebDAV 同目录文件名，帮助判断「版本文件路径/文件名写错」"""
+    parent = url.rstrip("/").rsplit("/", 1)[0] + "/"
+    try:
+        req = urllib.request.Request(parent, method="PROPFIND",
+                                     headers={"Depth": "1", "User-Agent": "kuaishou-roi-workbench"})
+        with _dav_opener(conf).open(req, timeout=10) as r:
+            xml = r.read(400_000).decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001
+        return [f"(列目录失败: {type(e).__name__}: {e})"]
+    self_name = url.rstrip("/").rsplit("/", 2)[-2] if url.rstrip("/").count("/") >= 3 else ""
+    names: list[str] = []
+    for m in re.finditer(r"<[^>]*:?href[^>]*>([^<]+)</[^>]*:?href>", xml):
+        name = m.group(1).strip().rstrip("/").rsplit("/", 1)[-1]
+        if not name or name == self_name:
+            continue
+        if name not in names:
+            names.append(name)
+    return names[:limit] or ["(目录为空或无权限列出)"]
+
+
 def _dav_release(cfg: dict) -> dict:
     """从 WebDAV 读取 version.json（Digest 认证）"""
     source = str(cfg.get("update_source") or "webdav").lower()
     conf = _dav_conf(source)
     path = str(cfg.get("update_webdav_path") or "/version.json").strip() or "/version.json"
+    url = _dav_url(conf, path)
     opener = _dav_opener(conf)
-    req = urllib.request.Request(_dav_url(conf, path),
-                                 headers={"User-Agent": "kuaishou-roi-workbench"})
-    with opener.open(req, timeout=20) as r:
-        info = json.loads(r.read().decode("utf-8"))
+    req = urllib.request.Request(url, headers={"User-Agent": "kuaishou-roi-workbench"})
+    print(f"[update] WebDAV 请求: {_mask_url(url)} | source={source} "
+          f"| 用户名={conf.get('username') or '(空)'} | 口令已解锁={'是' if app_secret.private_status().get('unlocked') else '否/不适用'}")
+    started = time.time()
+    try:
+        with opener.open(req, timeout=20) as r:
+            raw = r.read()
+            ctype = str(r.headers.get("Content-Type") or "")
+    except urllib.error.HTTPError as e:
+        body = _error_body(e)
+        hint = _status_hint(e.code, source)
+        _log_http_failure("WebDAV ", url, e.code, str(e.reason), body, hint, time.time() - started, source)
+        if e.code == 404:
+            listing = _dav_list_dir(conf, url)
+            ok_list = bool(listing) and not listing[0].startswith("(")
+            if ok_list:
+                print(f"[update] WebDAV 同目录可见内容（{_mask_url(url.rsplit('/', 1)[0] + '/')}）: "
+                      + ", ".join(listing))
+                hint += "；同目录可见：" + ", ".join(listing)
+            else:
+                print(f"[update] WebDAV 同目录无法列出: {listing[0] if listing else '空'}")
+        raise UpdateError(f"WebDAV 返回 HTTP {e.code} {e.reason}" + (f"：{hint}" if hint else ""),
+                          source=source, url=_mask_url(url), status=e.code,
+                          detail=body, hint=hint) from e
+    except urllib.error.URLError as e:
+        msg = _log_network_failure("WebDAV ", url, e.reason, time.time() - started, source)
+        raise UpdateError(msg, source=source, url=_mask_url(url), detail=str(e.reason),
+                          hint="确认这台设备能访问该 WebDAV 地址（同一网络/VPN），以及地址端口是否正确") from e
+    try:
+        info = json.loads(raw.decode("utf-8", "replace"))
+    except Exception as e:  # noqa: BLE001
+        preview = " ".join(raw[:300].decode("utf-8", "replace").split())
+        print(f"[update] WebDAV 返回内容不是 JSON: Content-Type={ctype} 内容={preview!r}")
+        raise UpdateError(f"版本文件不是合法 JSON（{_mask_url(url)}，Content-Type={ctype or '未知'}）",
+                          source=source, url=_mask_url(url), detail=preview,
+                          hint="确认该地址指向 version.json 本身，而不是目录页面/登录页面") from e
+    print(f"[update] WebDAV 成功: version={info.get('version')} download={info.get('download') or info.get('url')} "
+          f"用时 {time.time() - started:.1f}s")
     dl = str(info.get("download") or info.get("url") or "").strip()
     if dl and not dl.startswith("http"):
         dl = f"{path.rsplit('/', 1)[0]}/{dl}"
@@ -1469,9 +1636,24 @@ def _update_info(cfg: dict) -> dict:
 def api_update_check() -> dict:
     with CFG_LOCK:
         cfg = dict(CFG)
-    info = _update_info(cfg)
-    print(f"[update] 检查更新: source={info['source']} current={info['current']} "
-          f"latest={info['latest']} has_update={info['has_update']}")
+    src = str(cfg.get("update_source") or "github").strip().lower()
+    if src in ("webdav", "webdav_private"):
+        target = f"path={cfg.get('update_webdav_path') or '/version.json'}"
+    else:
+        target = f"repo={cfg.get('update_repo') or '(未配置)'}"
+    print(f"[update] 开始检查更新: source={src} {target} current={cfg.get('version')} "
+          f"proxy={'有' if str(cfg.get('update_proxy') or '').strip() else '无'}")
+    started = time.time()
+    try:
+        info = _update_info(cfg)
+    except UpdateError as e:
+        ctx = e.update_context
+        print(f"[update] 检查失败: source={ctx.get('source')} status={ctx.get('status')} "
+              f"url={ctx.get('url')} 用时 {time.time() - started:.1f}s")
+        raise
+    print(f"[update] 检查完成: source={info['source']} current={info['current']} "
+          f"latest={info['latest']} has_update={info['has_update']} "
+          f"asset={((info.get('asset') or {}).get('name')) or '无'} 用时 {time.time() - started:.1f}s")
     return info
 
 
@@ -2214,6 +2396,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, html, "text/html; charset=utf-8")
             if u.path == "/api/state":
                 return self._json(api_state())
+            if u.path == "/api/realtime/history":
+                try:
+                    data = rt_history.series(
+                        kx.DATA_DIR,
+                        dim=(q.get("dim") or "day").lower(),
+                        metric=(q.get("metric") or "cost").lower(),
+                        scope=(q.get("scope") or "recent").lower(),
+                        anchor=(q.get("anchor") or None),
+                    )
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+                except Exception as e:  # noqa: BLE001
+                    traceback.print_exc()
+                    return self._json({"error": f"读取历史失败: {type(e).__name__}: {e}"}, 500)
+                return self._json(data)
             if u.path == "/api/config":
                 return self._json(api_config())
             if u.path == "/api/preview":
@@ -2248,8 +2445,14 @@ class Handler(BaseHTTPRequestHandler):
                 except app_secret.PrivatePassphraseRequired as e:
                     return self._json({"error": str(e), "need_passphrase": True}, 401)
                 except Exception as e:  # noqa: BLE001
+                    ctx = getattr(e, "update_context", None) or {}
                     print(f"[web] 检查更新失败: {type(e).__name__}: {e}")
-                    return self._json({"error": str(e)}, 502)
+                    if ctx:
+                        print(f"[web] 检查更新失败详情: {json.dumps(ctx, ensure_ascii=False)}")
+                    payload = {"error": str(e)}
+                    if ctx:
+                        payload["update_error"] = ctx
+                    return self._json(payload, 502)
             if u.path == "/api/update/speedtest":
                 try:
                     return self._json(api_update_speedtest())
