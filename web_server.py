@@ -2008,6 +2008,7 @@ UPDATER_PS1_TEXT = r"""param(
   [string]$Exe = '快手数据工作台.exe',
   [string]$AliveFile,
   [string]$Manifest,
+  [string]$RetryMarker,
   [switch]$NoGui
 )
 
@@ -2282,6 +2283,14 @@ if (-not (Test-Path -LiteralPath $newInternal) -or -not (Test-Path -LiteralPath 
   Show-Failure '升级包不完整（缺少新的 _internal 或 exe）'
 }
 
+Write-Log '暂存目录自检'
+$srcOk = $true
+try { $srcOk = Test-Install $New } catch { Write-Log ('暂存目录自检异常（忽略）: ' + $_.Exception.Message) }
+if (-not $srcOk) {
+  Write-RetryMarker '暂存目录自检未通过'
+  Show-Failure '升级包不完整（暂存目录自检未通过），本次未做任何替换；程序将自动改用全量包重试。'
+}
+
 function Test-Install([string]$root) {
   if (-not $Manifest -or -not (Test-Path -LiteralPath $Manifest)) {
     Write-Log '没有清单文件，跳过安装自检'
@@ -2316,6 +2325,31 @@ function Test-Install([string]$root) {
   }
   Write-Log ('安装自检通过（' + $m.files.Count + ' 个文件）')
   return $true
+}
+
+function Write-RetryMarker([string]$reason) {
+  $mode = 'full'
+  try {
+    $p = Read-Progress
+    if ($p -and $p.mode) { $mode = [string]$p.mode }
+  } catch { }
+  if ($mode -ne 'delta') {
+    Write-Log ('上次使用 ' + $mode + ' 包，无需全量重试')
+    return
+  }
+  if (-not $RetryMarker) { return }
+  try {
+    $n = 0
+    if (Test-Path -LiteralPath $RetryMarker) {
+      $old = Get-Content -LiteralPath $RetryMarker -Raw -Encoding UTF8 | ConvertFrom-Json
+      if ($old -and $old.attempt) { $n = [int]$old.attempt }
+    }
+    $obj = [ordered]@{ attempt = ($n + 1); last_mode = $mode; reason = $reason; at = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') }
+    ($obj | ConvertTo-Json -Compress) | Set-Content -LiteralPath $RetryMarker -Encoding UTF8
+    Write-Log ('已写入全量重试标记: ' + ($obj | ConvertTo-Json -Compress))
+  } catch {
+    Write-Log ('写全量重试标记失败: ' + $_.Exception.Message)
+  }
 }
 
 function Restore-Old {
@@ -2363,8 +2397,14 @@ if (-not (Copy-WithRetry $newExe $appExe)) {
 
 Write-Log '替换完成，开始安装自检'
 Set-Stage '校验文件' '正在校验安装完整性…' 1500
-if (-not (Test-Install $App)) {
+$installOk = $true
+try { $installOk = Test-Install $App } catch { Write-Log ('安装自检异常（忽略）: ' + $_.Exception.Message) }
+if (-not $installOk) {
+  Write-RetryMarker '安装后自检未通过'
   Restore-Old
+  Set-Stage '已回滚' '安装不完整，正在还原旧版本…' 800
+  try { Start-Process -FilePath $appExe -WorkingDirectory $App } catch { }
+  Start-Sleep -Seconds 2
   Show-Failure '升级包不完整或文件被杀毒软件拦截，已回滚到旧版本。请重新下载全量包后再试。'
 }
 
@@ -2390,6 +2430,7 @@ if ($null -ne $proc) {
 
 if (-not $alive) {
   Write-Log '新版本启动后未存活，自动回滚'
+  Write-RetryMarker '新版本启动失败'
   Restore-Old
   Set-Stage '已回滚' '新版本启动失败，已还原旧版本…' 800
   try { Start-Process -FilePath $appExe -WorkingDirectory $App } catch { }
@@ -2430,9 +2471,63 @@ def run_updater(ps1: Path, new_root: Path):
         "-AppPid", str(os.getpid()), "-ProgressFile", str(UPDATE_PROGRESS),
         "-LogPath", str(log_path), "-Exe", APP_EXE, "-AliveFile", str(UPDATER_ALIVE),
         "-Manifest", str(UPDATE_DIR / "manifest.json"),
+        "-RetryMarker", str(UPDATE_DIR / "retry_full.json"),
     ]
     flags = 0x08000000  # CREATE_NO_WINDOW：DETACHED_PROCESS 会让 powershell 直接退出不执行脚本
     subprocess.Popen(args, creationflags=flags, close_fds=True)
+
+
+RETRY_MARKER = UPDATE_DIR / "retry_full.json"
+
+
+def _auto_full_upgrade():
+    """增量升级自检失败后的自动重试：强制走全量包，再交给升级器替换 + 自检"""
+    try:
+        print("[update] 自动改用全量包重试升级…")
+        try:
+            app_runtime.notify("正在重试升级", "上次增量升级未通过自检，正在下载全量包…")
+        except Exception:  # noqa: BLE001
+            pass
+        info = stage_update(logger=lambda m: print(m), force_full=True)
+        run_updater(_write_updater(), UPDATE_DIR / "new")
+        if not _wait_updater_alive(20):
+            print("[update] 升级窗口未就绪，取消本次自动重试")
+            return
+        print(f"[update] 全量升级已就绪（v{info.get('latest')}），程序即将退出并重启")
+        app_runtime.quit_app(3.0)
+    except Exception as e:  # noqa: BLE001
+        print(f"[update] 自动全量重试失败: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        try:
+            RETRY_MARKER.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def maybe_retry_full_update():
+    """启动时检查升级器留下的标记：增量自检没过 → 自动重试全量包"""
+    if not RETRY_MARKER.exists():
+        return
+    try:
+        info = json.loads(RETRY_MARKER.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        info = {}
+    try:
+        RETRY_MARKER.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+    attempt = int(info.get("attempt") or 1)
+    last = str(info.get("last_mode") or "")
+    print(f"[update] 检测到上次升级未通过（mode={last}, attempt={attempt}, "
+          f"reason={info.get('reason')}）")
+    if last != "delta" or attempt > 2:
+        print("[update] 全量包也未能通过自检，停止自动重试，请手动下载全量包")
+        try:
+            app_runtime.notify("升级失败", "上次升级未通过自检，请手动下载全量包安装")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    threading.Thread(target=_auto_full_upgrade, daemon=True, name="update-retry-full").start()
 
 
 def _wait_updater_alive(timeout: float = 10.0) -> bool:
@@ -2502,8 +2597,11 @@ def _extract_full_zip(zip_path: Path, new_dir: Path, size: int, emit, logger) ->
                      downloaded=size, total=size)
 
 
-def stage_update(logger=print, progress=None) -> dict:
-    """检查 + 下载 + （增量叠加 / 全量解压）准备新版本目录"""
+def stage_update(logger=print, progress=None, force_full: bool = False) -> dict:
+    """检查 + 下载 + （增量叠加 / 全量解压）准备新版本目录
+
+    force_full=True 时忽略增量包，直接走全量（增量自检失败后的自动重试走这里）。
+    """
     def emit(**kw):
         if progress:
             progress(kw)
@@ -2521,7 +2619,9 @@ def stage_update(logger=print, progress=None) -> dict:
         raise RuntimeError("该 Release 未上传 zip 升级包")
 
     delta = info.get("delta") or {}
-    prefer_delta = bool(cfg.get("update_delta_prefer", True))
+    prefer_delta = bool(cfg.get("update_delta_prefer", True)) and not force_full
+    if force_full:
+        logger("[update] 指定使用全量包（增量自检未通过后的自动重试）")
     use_delta = bool(prefer_delta and delta.get("url")
                      and str(delta.get("from_version") or "") == str(info.get("current") or ""))
     if delta.get("url") and not use_delta:
@@ -2581,7 +2681,8 @@ def stage_update(logger=print, progress=None) -> dict:
     if not (root / APP_EXE).exists() or not (root / "_internal").exists():
         raise RuntimeError("升级包里缺少 exe 或 _internal，已中止")
 
-    emit(phase="ready", percent=100, text="升级包已就绪，准备重启…")
+    emit(phase="ready", percent=100, text="升级包已就绪，准备重启…",
+         mode="delta" if used_delta else "full")
     logger(f"[update] {'增量' if used_delta else '全量'}升级已就绪（v{info['latest']}），即将重启替换")
     return {
         "current": info["current"],
@@ -3192,6 +3293,7 @@ def main():
     print(f"[web] 登录账号 {len(kx.login_accounts(CFG))} 个"
           + ("" if kx.login_accounts(CFG) else "（请先在「账号管理」添加）"))
     app_runtime.cleanup_old_version()
+    maybe_retry_full_update()
     _ensure_month_books()
     threading.Thread(target=realtime_scheduler_loop, daemon=True, name="realtime-auto").start()
     print("[auto] 后台自动刷新调度已启动（按配置开关/间隔/时段）")
