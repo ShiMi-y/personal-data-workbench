@@ -842,7 +842,10 @@ def api_save_config(body: dict) -> dict:
             raise ValueError("更新源只能是 github / webdav / webdav_private")
         cfg["update_source"] = src
     if "update_webdav_path" in body:
-        cfg["update_webdav_path"] = str(body.get("update_webdav_path") or "/version.json").strip() or "/version.json"
+        dav_path = str(body.get("update_webdav_path") or kx.DEFAULT_DAV_PATH).strip() or kx.DEFAULT_DAV_PATH
+        if not (dav_path.startswith("/") or re.match(r"^https?://", dav_path, re.I)):
+            raise ValueError("版本文件路径需以 / 开头（如 /kuaishou/version.json），或填完整 http(s) 地址")
+        cfg["update_webdav_path"] = dav_path
     if "update_github_mirror_enabled" in body:
         cfg["update_github_mirror_enabled"] = bool(body["update_github_mirror_enabled"])
     if "update_github_mirror" in body:
@@ -1577,9 +1580,10 @@ def _dav_release(cfg: dict) -> dict:
     """从 WebDAV 读取 version.json（Digest 认证）"""
     source = str(cfg.get("update_source") or "webdav").lower()
     conf = _dav_conf(source)
-    path = str(cfg.get("update_webdav_path") or "/version.json").strip() or "/version.json"
+    path = str(cfg.get("update_webdav_path") or kx.DEFAULT_DAV_PATH).strip() or kx.DEFAULT_DAV_PATH
     bundled = str(conf.get("update_webdav_path") or "").strip()
-    if source == "webdav_private" and bundled and path == "/version.json" and bundled != path:
+    if (source == "webdav_private" and bundled and bundled not in kx.LEGACY_DAV_PATHS
+            and path == kx.DEFAULT_DAV_PATH and bundled != path):
         print(f"[update] 私有文件内含版本路径 {bundled}，本机为默认值，按私有文件为准")
         path = bundled
     url = _dav_url(conf, path)
@@ -1770,7 +1774,7 @@ def api_update_check() -> dict:
         cfg = dict(CFG)
     src = str(cfg.get("update_source") or "github").strip().lower()
     if src in ("webdav", "webdav_private"):
-        target = f"path={cfg.get('update_webdav_path') or '/version.json'}"
+        target = f"path={cfg.get('update_webdav_path') or kx.DEFAULT_DAV_PATH}"
     else:
         target = f"repo={cfg.get('update_repo') or '(未配置)'}"
     print(f"[update] 开始检查更新: source={src} {target} current={cfg.get('version')} "
@@ -3047,7 +3051,7 @@ class Handler(BaseHTTPRequestHandler):
                         if not passphrase:
                             raise ValueError("生成私有文件需要设置口令")
                         with CFG_LOCK:
-                            dav_path = str(CFG.get("update_webdav_path") or "/version.json")
+                            dav_path = str(CFG.get("update_webdav_path") or kx.DEFAULT_DAV_PATH)
                         app_secret.export_private(passphrase, {"update_webdav_path": dav_path})
                         print("[webdav] 已生成/更新私有文件 webdav_private.dat（口令加密，可跨设备；"
                               f"内含版本文件路径 {dav_path}）")

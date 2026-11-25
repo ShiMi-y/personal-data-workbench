@@ -106,7 +106,7 @@ Windows 下双击 `run_daily.bat` 等同 `python run_daily.py`。
 | `realtime_window_start` / `realtime_window_end` | 自动刷新时段，默认 `08:50` ~ `18:05`，可跨零点 |
 | `update_source` | 更新源：`github`（默认）/ `webdav` / `webdav_private` |
 | `update_repo` | GitHub 更新仓库，格式 `owner/repo`；私有仓库需系统环境变量 `GITHUB_TOKEN` |
-| `update_webdav_path` | WebDAV 版本文件路径，默认 `/version.json`（地址与账号不写配置） |
+| `update_webdav_path` | WebDAV 版本文件路径，默认 `/kuaishou/version.json`（可在设置页单独保存，地址与账号不写配置） |
 | `update_delta_prefer` | 是否优先使用增量升级包，默认 `true` |
 | `filter_by_excel` | 只导出月度表里存在的账户（推荐开启） |
 | `web.host` / `web.port` | 本地服务监听地址与端口，默认 `127.0.0.1:8765` |

@@ -1232,11 +1232,18 @@ details.cfgfold summary .hint { margin-top: 0; font-weight: 400; }
             <input type="password" id="cfgDavPass" placeholder="密码（已保存则留空）" style="flex:1;min-width:120px" />
           </div>
           <div style="display:flex;gap:8px;align-items:center;margin-top:7px;flex-wrap:wrap">
-            <input type="text" id="cfgDavPath" placeholder="版本文件路径，如 /kuaishou/version.json" style="flex:1;min-width:260px" />
             <button class="ghost" id="btnDavSave">保存连接</button>
             <button class="ghost" id="btnDavTest">测试连接</button>
             <button class="ghost" id="btnDavClear">清除</button>
             <span class="hint" id="davHint" style="margin-top:0"></span>
+          </div>
+        </div>
+        <div class="field wide" id="davPathBox" style="display:none">
+          <label>版本文件路径</label>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <input type="text" id="cfgDavPath" placeholder="/kuaishou/version.json（放在根目录时填 /version.json）" style="flex:1;min-width:280px" />
+            <button class="ghost" id="btnDavPathSave">保存路径</button>
+            <span class="hint" id="davPathHint" style="margin-top:0">换设备后路径可能不同：这里可单独保存，无需重填地址/账号</span>
           </div>
         </div>
         <div class="field wide" id="davPrivateBox" style="display:none">
@@ -1654,7 +1661,7 @@ async function loadConfig() {
     $('#cfgDavUrl').value = c.webdav_url || '';
     $('#cfgDavUser').value = c.webdav_username || '';
     $('#cfgDavPass').value = '';
-    $('#cfgDavPath').value = c.update_webdav_path || '/version.json';
+    $('#cfgDavPath').value = c.update_webdav_path || '/kuaishou/version.json';
     $('#davHint').textContent = c.webdav_configured ? '已保存连接（密码不回显）' : '未配置';
     $('#davPrivateHint').textContent = privateHintText(c);
     toggleUpdateSource();
@@ -1769,6 +1776,30 @@ function toggleUpdateSource() {
   $('#ghUpdateBox').style.display = src === 'github' ? '' : 'none';
   $('#davUpdateBox').style.display = src === 'webdav' ? '' : 'none';
   $('#davPrivateBox').style.display = src === 'webdav_private' ? '' : 'none';
+  $('#davPathBox').style.display = (src === 'webdav' || src === 'webdav_private') ? '' : 'none';
+}
+
+async function saveDavPath() {
+  const btn = $('#btnDavPathSave');
+  const path = $('#cfgDavPath').value.trim() || '/kuaishou/version.json';
+  if (!path.startsWith('/') && !/^https?:\/\//i.test(path)) {
+    $('#davPathHint').textContent = '路径需以 / 开头（如 /kuaishou/version.json），或填完整 http(s) 地址';
+    return;
+  }
+  btn.disabled = true;
+  $('#davPathHint').textContent = '保存中…';
+  try {
+    await api('/api/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ update_webdav_path: path }),
+    });
+    $('#davPathHint').textContent = `路径已保存：${path}`;
+    await loadConfig();
+  } catch (e) {
+    $('#davPathHint').textContent = '保存失败：' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function saveDav() {
@@ -2879,6 +2910,7 @@ $('#btnSaveCfg').addEventListener('click', saveConfig);
 $('#btnSpeedTest').addEventListener('click', runSpeedTest);
 $('#cfgUpdateSource').addEventListener('change', toggleUpdateSource);
 $('#btnDavSave').addEventListener('click', saveDav);
+$('#btnDavPathSave').addEventListener('click', saveDavPath);
 $('#btnDavTest').addEventListener('click', testDav);
 $('#btnDavClear').addEventListener('click', clearDav);
 $('#btnDavExport').addEventListener('click', exportDavPrivate);

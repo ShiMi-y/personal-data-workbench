@@ -43,7 +43,10 @@ else:
     BUNDLE_DIR = BASE
 
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "1.5.5"
+APP_VERSION = "1.5.6"
+# 版本文件默认放在 WebDAV 的 /kuaishou/ 子目录下；旧默认值（/version.json）在加载配置时自动迁移
+DEFAULT_DAV_PATH = "/kuaishou/version.json"
+LEGACY_DAV_PATHS = ("/version.json",)
 PROFILE_DIR = BASE / ".browser_profile"
 PROFILES_DIR = BASE / ".browser_profiles"
 DATA_DIR = BASE / "data"
@@ -158,7 +161,11 @@ def load_config(path: Path | None = None) -> dict:
     cfg.setdefault("version", APP_VERSION)
     cfg.setdefault("update_repo", "")
     cfg.setdefault("update_source", "github")
-    cfg.setdefault("update_webdav_path", "/version.json")
+    dav_path = str(cfg.get("update_webdav_path") or "").strip()
+    dav_migrated = False
+    if not dav_path or dav_path in LEGACY_DAV_PATHS:
+        cfg["update_webdav_path"] = DEFAULT_DAV_PATH
+        dav_migrated = dav_path != DEFAULT_DAV_PATH
     cfg.setdefault("update_github_mirror_enabled", False)
     cfg.setdefault("update_github_mirror", "https://ghproxy.net/")
     cfg.setdefault("update_proxy", "")
@@ -169,10 +176,13 @@ def load_config(path: Path | None = None) -> dict:
     cfg.setdefault("realtime_window_end", "18:05")
     cfg.setdefault("realtime_retry_enabled", True)
     cfg.setdefault("realtime_retry_max", 3)
-    if migrated:
+    if migrated or dav_migrated:
         try:
             p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"[config] 已自动升级配置结构：登录账号 {len(cfg['accounts'])} 个，密码已加密")
+            if migrated:
+                print(f"[config] 已自动升级配置结构：登录账号 {len(cfg['accounts'])} 个，密码已加密")
+            if dav_migrated:
+                print(f"[config] 版本文件路径已更新为默认值 {DEFAULT_DAV_PATH}")
         except OSError as e:
             print(f"[config] 配置升级后写回失败: {e}")
     return cfg
