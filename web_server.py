@@ -1639,7 +1639,12 @@ def _dav_release(cfg: dict) -> dict:
         d_dl = str(delta.get("download") or delta.get("url") or "").strip()
         if d_dl and not d_dl.startswith("http"):
             d_dl = f"{path.rsplit('/', 1)[0]}/{d_dl}"
-        delta = {"from": str(delta.get("from") or "").strip().lstrip("vV"),
+        raw_from = delta.get("from")
+        if isinstance(raw_from, list):
+            from_spec = [str(x).strip().lstrip("vV") for x in raw_from if str(x).strip()]
+        else:
+            from_spec = str(raw_from or "").strip().lstrip("vV")
+        delta = {"from": from_spec,
                  "download": d_dl,
                  "size": delta.get("size"),
                  "sha256": str(delta.get("sha256") or "").strip()}
@@ -1719,7 +1724,8 @@ def _update_info(cfg: dict) -> dict:
             delta_asset = {"name": d["download"].rsplit("/", 1)[-1] or "delta.zip",
                            "size": d.get("size"), "url": d["download"],
                            "sha256": d.get("sha256") or "",
-                           "from_version": d.get("from") or ""}
+                           "from_version": d.get("from") or "",
+                           "from_versions": d.get("from_versions") or ""}
         notes = rel["notes"]
         page = ""
         repo = ""
@@ -1742,16 +1748,19 @@ def _update_info(cfg: dict) -> dict:
             "sha256": pick.get("digest") or "",
         }
         delta_asset = None
+        cands = []
         for a in zips:
             name = str(a.get("name") or "")
             if "-delta" not in name.lower():
                 continue
             m = re.search(r"from-v([0-9A-Za-z._-]+?)-", name)
-            delta_asset = {"name": name, "size": a.get("size"),
-                           "url": a.get("browser_download_url"),
-                           "sha256": a.get("digest") or "",
-                           "from_version": (m.group(1) if m else "")}
-            break
+            cands.append({"name": name, "size": a.get("size"),
+                          "url": a.get("browser_download_url"),
+                          "sha256": a.get("digest") or "",
+                          "from_version": (m.group(1) if m else "")})
+        # 优先挑「能匹配当前版本」的增量包（精确版本或 1.5.x 这类版本线通配）
+        delta_asset = next((c for c in cands if ud.delta_from_match(cur, c["from_version"])),
+                           cands[0] if cands else None)
         notes = (rel.get("body") or "")[:2000]
         page = rel.get("html_url") or ""
         repo = str(cfg.get("update_repo") or "")
@@ -2626,11 +2635,14 @@ def stage_update(logger=print, progress=None, force_full: bool = False) -> dict:
     prefer_delta = bool(cfg.get("update_delta_prefer", True)) and not force_full
     if force_full:
         logger("[update] 指定使用全量包（增量自检未通过后的自动重试）")
+    current = str(info.get("current") or "")
     use_delta = bool(prefer_delta and delta.get("url")
-                     and str(delta.get("from_version") or "") == str(info.get("current") or ""))
+                     and ud.delta_from_match(current, delta.get("from_version") or delta.get("from_versions")))
     if delta.get("url") and not use_delta:
+        spec = delta.get("from_version") or delta.get("from_versions")
+        show = ", ".join(spec) if isinstance(spec, (list, tuple)) else (spec or "?")
         why = "设置里关闭了「优先增量升级」" if not prefer_delta else \
-            f"增量包只适用于 v{delta.get('from_version') or '?'}"
+            f"增量包只适用于 v{show}"
         logger(f"[update] {why}（当前 v{info['current']}），本次使用全量包")
     elif not delta.get("url"):
         logger("[update] 该版本未提供增量包，使用全量包")

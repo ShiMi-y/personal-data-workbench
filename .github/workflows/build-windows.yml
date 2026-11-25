@@ -87,7 +87,7 @@ jobs:
           $buildArgs += 'web_server.py'
           python -m PyInstaller @buildArgs
 
-      - name: Fetch previous manifest
+      - name: Fetch line manifests
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -96,44 +96,57 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          $prevTag = ''
+          $line = (($env:APP_VERSION -split '\.')[0..1] -join '.')
+          Write-Host "版本线: $line"
+          $tags = @()
           try {
-            $list = gh release list --limit 20 --json tagName,isDraft | ConvertFrom-Json
-            $cand = @($list) | Where-Object { -not $_.isDraft -and $_.tagName -ne "v$env:APP_VERSION" }
-            if ($cand) { $prevTag = @($cand)[0].tagName }
+            $list = gh release list --limit 100 --json tagName,isDraft | ConvertFrom-Json
+            $tags = @($list) | Where-Object {
+              -not $_.isDraft -and $_.tagName -ne "v$env:APP_VERSION" -and
+              $_.tagName -match ("^v" + [regex]::Escape($line) + "\.")
+            } | ForEach-Object { $_.tagName }
           } catch { Write-Host "读取 Release 列表失败: $_" }
-          Write-Host "上一版: $prevTag"
-          if ($prevTag) {
-            New-Item -ItemType Directory -Force -Path prev | Out-Null
-            gh release download $prevTag -p manifest.json -D prev 2>$null
-            if (Test-Path 'prev/manifest.json') {
-              Add-Content -Path $env:GITHUB_ENV -Value "PREV_MANIFEST=prev/manifest.json" -Encoding ascii
-              Add-Content -Path $env:GITHUB_ENV -Value "PREV_VERSION=$($prevTag.TrimStart('v'))" -Encoding ascii
-              Write-Host "已取到上一版 manifest.json"
-            } else {
-              Write-Host "上一版没有 manifest.json，尝试从它的升级包现算"
-              $prevVer = $prevTag.TrimStart('v')
-              Add-Content -Path $env:GITHUB_ENV -Value "PREV_VERSION=$prevVer" -Encoding ascii
-              gh release download $prevTag -p '*win64.zip' -D prev 2>$null
-              $prevZip = Get-ChildItem 'prev' -Filter *.zip -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($prevZip) {
-                Expand-Archive -LiteralPath $prevZip.FullName -DestinationPath 'prev\unz' -Force
-                $prevDist = 'prev\unz'
-                $subs = @(Get-ChildItem -LiteralPath $prevDist -Directory -ErrorAction SilentlyContinue)
-                if (-not (Test-Path (Join-Path $prevDist '快手数据工作台.exe')) -and $subs.Count -eq 1) {
-                  $prevDist = $subs[0].FullName
-                }
-                python tools/make_update_assets.py --dist $prevDist --version $prevVer --out prev --manifest-only
-                if (Test-Path 'prev\manifest.json') {
-                  Add-Content -Path $env:GITHUB_ENV -Value "PREV_MANIFEST=prev/manifest.json" -Encoding ascii
-                  Write-Host "已用上一版升级包生成清单，可产出增量包"
-                } else {
-                  Write-Host "上一版清单生成失败，本次只出全量"
-                }
-              } else {
-                Write-Host "上一版没有 win64.zip，本次只出全量"
-              }
+          Write-Host ("同线版本: " + ($tags -join ', '))
+          $manifests = New-Object System.Collections.ArrayList
+          $prevVersion = ''
+          foreach ($tag in $tags) {
+            $ver = $tag.TrimStart('v')
+            if (-not $prevVersion) { $prevVersion = $ver }
+            $dir = "prev/$ver"
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            gh release download $tag -p manifest.json -D $dir 2>$null
+            if (Test-Path "$dir/manifest.json") {
+              [void]$manifests.Add("$dir/manifest.json")
+              Write-Host "$tag 复用现成 manifest.json"
+              continue
             }
+            gh release download $tag -p '*win64.zip' -D $dir 2>$null
+            $zip = Get-ChildItem $dir -Filter *.zip -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $zip) { Write-Host "$tag 没有清单也没有 zip，跳过"; continue }
+            $unz = "$dir/unz"
+            Expand-Archive -LiteralPath $zip.FullName -DestinationPath $unz -Force
+            $dist = $unz
+            $subs = @(Get-ChildItem -LiteralPath $unz -Directory -ErrorAction SilentlyContinue)
+            if (-not (Test-Path (Join-Path $unz '快手数据工作台.exe')) -and $subs.Count -eq 1) {
+              $dist = $subs[0].FullName
+            }
+            python tools/make_update_assets.py --dist $dist --version $ver --out $dir --manifest-only
+            if (Test-Path "$dir/manifest.json") {
+              [void]$manifests.Add("$dir/manifest.json")
+              Write-Host "$tag 用升级包现算清单完成"
+            }
+            Remove-Item -Recurse -Force $zip.FullName, $unz -ErrorAction SilentlyContinue
+          }
+          if ($prevVersion) {
+            Add-Content -Path $env:GITHUB_ENV -Value "PREV_VERSION=$prevVersion" -Encoding ascii
+            Add-Content -Path $env:GITHUB_ENV -Value "PREV_MANIFEST=prev/$prevVersion/manifest.json" -Encoding ascii
+          }
+          if ($manifests.Count -gt 0) {
+            Add-Content -Path $env:GITHUB_ENV -Value ("PREV_MANIFESTS=" + ($manifests -join ';')) -Encoding ascii
+            Add-Content -Path $env:GITHUB_ENV -Value "DELTA_FROM=$line.x" -Encoding ascii
+            Write-Host ("共 " + $manifests.Count + " 个旧版本清单，将生成 from-v$line.x 增量包")
+          } else {
+            Write-Host "没有同线旧版本清单，本次只出全量"
           }
           exit 0
 
@@ -143,14 +156,20 @@ jobs:
           PYTHONUTF8: '1'
           PYTHONIOENCODING: utf-8
         run: |
-          $deltaName = ""
-          if ($env:PREV_VERSION) { $deltaName = "personal-data-workbench-v$env:APP_VERSION-from-v$env:PREV_VERSION-win64-delta.zip" }
-          $params = @('tools/make_update_assets.py', '--dist', 'dist_ci\快手数据工作台',
-                      '--version', $env:APP_VERSION, '--out', 'release')
-          if ($env:PREV_MANIFEST) {
-            $params += @('--prev-manifest', $env:PREV_MANIFEST, '--prev-version', $env:PREV_VERSION, '--delta-name', $deltaName)
+          $base = @('tools/make_update_assets.py', '--dist', 'dist_ci\快手数据工作台',
+                    '--version', $env:APP_VERSION, '--out', 'release')
+          # 1) 精确上一版增量包：给旧客户端（只认 from 精确版本）用
+          if ($env:PREV_MANIFEST -and (Test-Path $env:PREV_MANIFEST)) {
+            $name = "personal-data-workbench-v$env:APP_VERSION-from-v$env:PREV_VERSION-win64-delta.zip"
+            python @base --prev-manifest $env:PREV_MANIFEST --prev-version $env:PREV_VERSION --delta-name $name
           }
-          python @params
+          # 2) 版本线增量包：覆盖同一 1.X 线内所有补丁版
+          if ($env:PREV_MANIFESTS) {
+            $extra = @()
+            foreach ($m in ($env:PREV_MANIFESTS -split ';')) { $extra += @('--prev-manifest', $m) }
+            $name2 = "personal-data-workbench-v$env:APP_VERSION-from-v$env:DELTA_FROM-win64-delta.zip"
+            python @base @extra --delta-from $env:DELTA_FROM --delta-name $name2
+          }
 
       - name: Create zip
         shell: pwsh

@@ -79,6 +79,30 @@ def build_manifest(root, version: str = "", skip_dirs=None, skip_files=None) -> 
     }
 
 
+def delta_from_match(current: str, spec) -> bool:
+    """增量包声明的来源是否匹配当前版本
+
+    spec 支持：精确版本（1.5.6）、版本线通配（1.5.x / 1.5.*）、
+    逗号分隔字符串或列表（["1.5.0", "1.5.1"]）、全量通配（*）。
+    """
+    cur = str(current or "").strip().lstrip("vV")
+    if not cur:
+        return False
+    if isinstance(spec, (list, tuple, set)):
+        return any(delta_from_match(cur, x) for x in spec)
+    raw = str(spec or "").strip().lstrip("vV")
+    if not raw:
+        return False
+    if "," in raw:
+        return any(delta_from_match(cur, x) for x in raw.split(","))
+    if raw == "*":
+        return True
+    if raw.endswith(".x") or raw.endswith(".*"):
+        base = raw[:-2].rstrip(".")
+        return bool(base) and (cur == base or cur.startswith(base + "."))
+    return cur == raw
+
+
 def load_manifest(source) -> dict:
     """接受 dict / 路径 / 文件对象"""
     if isinstance(source, dict):
@@ -109,16 +133,49 @@ def diff_manifests(prev: dict, cur: dict) -> dict:
     }
 
 
-def make_delta(prev_manifest: dict, cur_manifest: dict, cur_root, out_zip, from_version: str = "") -> dict:
-    """生成增量 zip：新版清单 + 删除清单 + 变化文件"""
+def diff_manifests_many(olds, cur: dict) -> dict:
+    """对多个旧版本清单取并集：任一旧版本不同的文件都要打进增量包
+
+    用于「同一版本线内任意补丁版都能升级」的场景（如 1.5.x → 1.5.7）。
+    """
+    olds = [olds] if isinstance(olds, dict) else [m for m in olds if isinstance(m, dict)]
+    b = _index(cur)
+    changed: set[str] = set()
+    added: set[str] = set()
+    deleted: set[str] = set()
+    for prev in olds:
+        d = diff_manifests(prev, cur)
+        changed.update(d["changed"])
+        added.update(d["added"])
+        deleted.update(d["deleted"])
+    changed -= added
+    return {
+        "changed": sorted(changed),
+        "added": sorted(added),
+        "deleted": sorted(deleted),
+        "download_bytes": sum(int(b[p].get("size") or 0) for p in changed | added if p in b),
+        "total_bytes": sum(int(f.get("size") or 0) for f in cur.get("files") or []),
+    }
+
+
+def make_delta(prev_manifest, cur_manifest: dict, cur_root, out_zip,
+               from_version="", from_label: str = "") -> dict:
+    """生成增量 zip：新版清单 + 删除清单 + 变化文件
+
+    prev_manifest 可以是单个清单，也可以是多个旧版本清单的列表（取并集，
+    这样一个增量包就能覆盖同一版本线内的所有补丁版）。
+    """
     cur_root = Path(cur_root)
     out_zip = Path(out_zip)
-    diff = diff_manifests(prev_manifest, cur_manifest)
+    olds = [prev_manifest] if isinstance(prev_manifest, dict) else list(prev_manifest)
+    versions = [str(m.get("version") or "") for m in olds if isinstance(m, dict) and m.get("version")]
+    diff = diff_manifests_many(olds, cur_manifest)
     cur_index = _index(cur_manifest)
     out_zip.parent.mkdir(parents=True, exist_ok=True)
     meta = {
         "schema": SCHEMA,
-        "from": from_version or prev_manifest.get("version") or "",
+        "from": from_label or from_version or (versions[0] if len(versions) == 1 else versions),
+        "from_versions": versions,
         "to": cur_manifest.get("version") or "",
         "deleted": diff["deleted"],
         "changed": len(diff["changed"]),
@@ -162,13 +219,19 @@ def apply_delta(base_dir, delta_zip, out_dir, logger=print) -> dict:
         shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # 增量包里已经带上的文件（新增/变化的文件），不要求旧安装里存在
+    with zipfile.ZipFile(delta_zip) as z:
+        packed = {_safe_rel(i.filename) for i in z.infolist()
+                  if i.filename not in (MANIFEST_NAME, DELTA_META_NAME) and not i.filename.endswith("/")}
+
     missing = []
     copied = 0
     for f in files:
         rel = _safe_rel(f["path"])
         src = base_dir / rel
         if not src.is_file():
-            missing.append(rel)
+            if rel not in packed:
+                missing.append(rel)
             continue
         dst = out_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)

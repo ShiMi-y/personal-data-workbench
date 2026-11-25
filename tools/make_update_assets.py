@@ -35,8 +35,10 @@ def main() -> int:
     ap.add_argument("--dist", required=True, help="PyInstaller 产物目录（含 exe 与 _internal）")
     ap.add_argument("--version", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--prev-manifest", default="")
+    ap.add_argument("--prev-manifest", action="append", default=[],
+                    help="旧版本清单，可重复传多个：增量包按并集生成（支持同一版本线任意补丁版）")
     ap.add_argument("--prev-version", default="")
+    ap.add_argument("--delta-from", default="", help='增量包声明的来源，如 1.5.x（默认取 --prev-version）')
     ap.add_argument("--delta-name", default="")
     ap.add_argument("--manifest-only", action="store_true", help="只生成 manifest.json（给旧版本现算清单用）")
     args = ap.parse_args()
@@ -56,17 +58,19 @@ def main() -> int:
     if args.manifest_only:
         return 0
 
-    prev_path = Path(args.prev_manifest) if args.prev_manifest else None
-    if prev_path and prev_path.is_file() and args.delta_name:
-        prev = ud.load_manifest(prev_path)
-        delta = ud.make_delta(prev, cur, dist, out / args.delta_name,
-                              from_version=args.prev_version or prev.get("version") or "")
+    prev_paths = [Path(p) for p in (args.prev_manifest or []) if p]
+    olds = [ud.load_manifest(p) for p in prev_paths if p.is_file()]
+    if olds and args.delta_name:
+        label = args.delta_from or args.prev_version or ", ".join(
+            str(m.get("version") or "") for m in olds)
+        delta = ud.make_delta(olds, cur, dist, out / args.delta_name,
+                              from_version=args.prev_version, from_label=label)
         pct = delta["download_bytes"] * 100 / max(1, delta["total_bytes"])
         print(f"[delta] 增量包: {args.delta_name} "
               f"({delta['zip_size'] / 1024 / 1024:.1f} MB，变化 {delta['download_bytes'] / 1024 / 1024:.1f} MB = {pct:.1f}%)")
-        print(f"[delta] 变化 {delta['changed']} / 新增 {delta['added']} / 删除 {len(delta['deleted'])}")
+        print(f"[delta] 来源 {len(olds)} 个版本: {label}；变化 {delta['changed']} / 新增 {delta['added']} / 删除 {len(delta['deleted'])}")
     else:
-        print("[delta] 没有上一版清单，本次只生成全量包 + 清单（客户端会走全量升级）")
+        print("[delta] 没有旧版本清单，本次只生成全量包 + 清单（客户端会走全量升级）")
     return 0
 
 

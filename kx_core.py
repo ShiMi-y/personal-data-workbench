@@ -43,7 +43,7 @@ else:
     BUNDLE_DIR = BASE
 
 CONFIG_PATH = BASE / "config.json"
-APP_VERSION = "1.5.6"
+APP_VERSION = "1.5.7"
 # 版本文件默认放在 WebDAV 的 /kuaishou/ 子目录下；旧默认值（/version.json）在加载配置时自动迁移
 DEFAULT_DAV_PATH = "/kuaishou/version.json"
 LEGACY_DAV_PATHS = ("/version.json",)

@@ -119,3 +119,77 @@ class UpdateDeltaTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MultiFromDeltaTest(unittest.TestCase):
+    """同一版本线内任意补丁版都能用同一个增量包（并集）"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.dirs = {}
+        for name in ("v150", "v153", "v157"):
+            d = self.root / name
+            d.mkdir()
+            write(d, "快手数据工作台.exe", f"exe-{name}")
+            write(d, "_internal/web/index.html", "<html>v150</html>" if name == "v150" else f"<html>{name}</html>")
+            write(d, "_internal/keep.dat", "same")
+            self.dirs[name] = d
+        # v153 有、v157 已删除的文件；v150 也有（用于验证删除清单）
+        write(self.dirs["v150"], "_internal/old.txt", "old")
+        write(self.dirs["v153"], "_internal/old.txt", "old")
+        # v150 的 index.html 与 v157 相同，v153 不同：并集必须包含它
+        write(self.dirs["v157"], "_internal/web/index.html", "<html>v150</html>")
+        # v153 新增且 v157 保留的文件
+        write(self.dirs["v153"], "_internal/new.txt", "new")
+        write(self.dirs["v157"], "_internal/new.txt", "new")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _manifest(self, name, version):
+        return ud.build_manifest(self.dirs[name], version)
+
+    def test_union_covers_all_old_versions(self):
+        m150 = self._manifest("v150", "1.5.0")
+        m153 = self._manifest("v153", "1.5.3")
+        m157 = self._manifest("v157", "1.5.7")
+        diff = ud.diff_manifests_many([m150, m153], m157)
+        self.assertIn("快手数据工作台.exe", diff["changed"])
+        self.assertIn("_internal/web/index.html", diff["changed"])  # 仅 v153 与新版不同
+        self.assertIn("_internal/old.txt", diff["deleted"])
+
+    def test_delta_applies_to_every_old_version(self):
+        m150 = self._manifest("v150", "1.5.0")
+        m153 = self._manifest("v153", "1.5.3")
+        m157 = self._manifest("v157", "1.5.7")
+        out = self.root / "delta.zip"
+        ud.make_delta([m150, m153], m157, self.dirs["v157"], out, from_label="1.5.x")
+
+        import zipfile
+        with zipfile.ZipFile(out) as z:
+            meta = json.loads(z.read(ud.DELTA_META_NAME).decode("utf-8"))
+        self.assertEqual(meta["from"], "1.5.x")
+        self.assertEqual(sorted(meta["from_versions"]), ["1.5.0", "1.5.3"])
+
+        for name in ("v150", "v153"):
+            target = self.root / f"out_{name}"
+            ud.apply_delta(self.dirs[name], out, target)
+            self.assertEqual(ud.verify_tree(target, m157), [], name)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class DeltaFromMatchTest(unittest.TestCase):
+    def test_exact_and_wildcard(self):
+        self.assertTrue(ud.delta_from_match("1.5.6", "1.5.6"))
+        self.assertFalse(ud.delta_from_match("1.5.7", "1.5.6"))
+        self.assertTrue(ud.delta_from_match("1.5.0", "1.5.x"))
+        self.assertTrue(ud.delta_from_match("1.5.9", "1.5.*"))
+        self.assertFalse(ud.delta_from_match("1.6.0", "1.5.x"))
+        self.assertTrue(ud.delta_from_match("1.5.4", ["1.5.3", "1.5.4"]))
+        self.assertTrue(ud.delta_from_match("1.5.4", "1.5.3,1.5.4"))
+        self.assertTrue(ud.delta_from_match("1.5.4", "*"))
+        self.assertFalse(ud.delta_from_match("1.5.4", ""))
